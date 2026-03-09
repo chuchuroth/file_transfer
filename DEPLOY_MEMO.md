@@ -401,3 +401,62 @@ QNC_REMOTE_GRIPPER=1 QNC_GRIPPER_MODEL=CGC-80 QNC_DEMO_CYCLES=30 \
 
 wait
 ```
+
+---
+
+## Bug 6 — Only one gripper initialises and moves in dual-gripper run (diagnosed 2026-03-09, **fix pending**)
+
+**Symptom:** When both `--test` instances are launched in parallel (AG160-95 and CGC-80), only
+one gripper performs its calibration stroke and executes the 30-cycle run.  The second
+gripper is silent.
+
+**Root cause — three independent defects across both machines:**
+
+### 6a — `qnc_bridge.cpp` was never updated to the dual-port architecture (Pi CM5)
+
+`main()` reads only `QNC_SERIAL_PORT` and opens a single `ModbusRtu` instance.  The
+multi-port env vars documented in § Runtime configuration (`QNC_SERIAL_PORT_2`,
+`QNC_SLAVE_ID_1`, `QNC_SLAVE_ID_2`, `QNC_MODBUS_ADDR_1`, `QNC_MODBUS_ADDR_2`) are
+**not wired up in the source**.  `QncBridge` holds only one `ModbusRtu*` pointer.
+The default port is still `/dev/ttyAMA0` (the Pi CM5 built-in UART — nothing
+connected), not `/dev/gripper_ag160`.
+
+Evidence — actual `qnc_bridge` startup banner vs. what the memo promises:
+
+| Expected (memo) | Actual |
+|-----------------|--------|
+| `Port 1 : /dev/gripper_ag160 (dds_slave_id=1 modbus_wire_addr=1)` | `Serial port  : /dev/ttyAMA0` |
+| `Port 2 : /dev/gripper_cgc80 (dds_slave_id=2 modbus_wire_addr=1)` | _(absent)_ |
+
+**Fix required on Pi CM5:** implement dual-port `main()` — read `QNC_SERIAL_PORT_2`,
+open two `ModbusRtu` instances, and broadcast every write/read command to both ports
+(the `all_buses()` pattern described in Bug 4).
+
+### 6b — `device_id` is not settable via environment variable (robot computer)
+
+`GripperConfig::from_env()` reads `QNC_GRIPPER_MODEL`, `QNC_DEMO_CYCLES`, and
+`QNC_REMOTE_GRIPPER` but **never reads a slave-ID env var**.  `device_id` is
+hardcoded to `1` for both instances.  Even if the bridge correctly routed by
+`slave_id`, both parallel processes would publish all commands as `slave_id=1`,
+so the CGC-80 instance would drive port 1 (AG-160) instead of port 2.
+
+**Fix required on robot computer:** add `QNC_SLAVE_ID` support in
+`GripperConfig::from_env()` so the CGC-80 test can be launched with
+`QNC_SLAVE_ID=2`.
+
+### 6c — Single `init_wait_active_` flag serialises two calibration windows (Pi CM5)
+
+`QncBridge::spin()` has one `init_wait_active_` / `init_wait_until_` pair for the
+entire bridge.  When the AG-160 init command (reg=0x0100) arrives, the flag is set
+and `spin()` discards all write_cmds for 3500 ms.  The CGC-80 init command that
+arrives during this window is consumed-and-discarded — it never reaches RS485, so the
+CGC-80 never calibrates and ignores all subsequent motion commands.
+
+**Fix required on Pi CM5:** give each configured port its own calibration state so
+both grippers can initialise concurrently (or sequentially with independent timers).
+
+---
+
+**Action required:**
+1. **Pi CM5** — rebuild and redeploy `qnc_bridge` after fixing 6a and 6c.
+2. **Robot computer** — rebuild `gripper_control_tests` after fixing 6b.
