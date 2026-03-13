@@ -1,0 +1,9 @@
+# Build output
+nucleo/industrial_automation_nucleo/Debug/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
