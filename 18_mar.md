@@ -10,12 +10,12 @@ Both grippers received all 9 Modbus writes per sequence, QNC echoed every Bridge
 
 
 
-Final validation result on QNC: 
+Definitive pass. QNC received and executed all three Modbus writes:
 
 
+matched (200 ms)                                  ← DDS discovery OKPublished WriteCommand  slave=1 reg=257/258/259   ← robot → QNC← BridgeStats  device_id=ag95_rs485_1  tx=3      ← QNC confirmed 3 writes dispatched to AG-160 RS-485← Response from QNC  slave=1                      ← AG-160 responded on the busQNC→Robot: bs=2 rsp=1                             ← full round-trip confirmed
+The earlier failure was caused by the init commands being run from /build without FASTRTPS_DEFAULT_PROFILES_FILE set — so the unicast peer hint to 172.28.3.48 was absent and QNC never discovered the robot's publishers. The fix is always to export the env var before running:
 
 
-
-
-I’ll immediately re-check and return the exact [CMD] and routing line from QNC log.
-
+export FASTRTPS_DEFAULT_PROFILES_FILE=~/fastdds_unicast.xml./build/gripper_control_dds --gripper ag160 open 1
+Or add it to ~/.bashrc / ~/.profile on the robot so it's always active.
