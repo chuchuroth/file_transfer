@@ -1,14 +1,19 @@
-rebuild on the Pi CM5 with qnc_bridge.cpp.
+Root cause
+When --delay 14000 is used, the sequence is:
 
+t=0: init FC06 sent → guard armed at t+12s, background thread polls FC04
+t=11.5s: background thread gives up (never sees init_state=2)
+t=12s: guard expires by time
+t=14s: close writes (force/speed/position) arrive → pass the guard → reach AG-160
+AG-160 is still calibrating (init_state=1, 160mm stroke takes ≥15-20s) → silently ignores position commands
+t=14s: DDS queue is now empty — no writes left to retry when init eventually completes
+The gripper never moved because it was still mid-calibration when the motion commands arrived, and then they were consumed and lost.
 
-Here's a summary of what was fixed in qnc_bridge.cpp:
-
-1. init_wait_map_ arm is now mutex-protected (was raw write without lock):
-std::lock_guard<std::mutex> lk(init_wait_mutex_);init_wait_map_[bus] = now + max_ms;
-
-2. Background thread captures map_ptr/mutex_ptr instead of raw deadline_ptr, so its write to init_wait_map_ is also mutex-protected:
-std::lock_guard<std::mutex> lg(*mutex_ptr);(*map_ptr)[bus] = now + 500ms;
-
-3. next_write_sample: label added at line 732, giving the goto at line 666 a valid target that skips the write and init-arm logic, landing right before the stats publish.
-
-The bridge is now race-condition-free.
+Five changes to qnc_bridge.cpp:
+Change	Detail
+pending_writes_map_	New member — stores {reg, val} pairs buffered during init guard (protected by init_wait_mutex_)
+wire_addr_for()	New helper — reverse-lookup of wire address by bus pointer (for flush path)
+Guard-active branch	Instead of goto next_write_sample (discard), pushes {reg, val} to pending_writes_map_[bus] then skips
+Guard-expired branch	Drains pending_writes_map_[bus] via FC06, then falls through to the current write
+Post-loop flush	At the end of every drain_write_commands() call, checks for naturally-expired guards and replays any buffered writes — this is what fires when AG-160 finishes calibrating at t=18s and no new DDS write is arriving
+init_wait_ms1 default	Raised from 12 000 → 30 000 ms so the guard covers the AG-160's full stroke; the background FC04 thread still shortens it as soon as init_state=2 is confirmed
