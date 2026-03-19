@@ -37,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <set>
 #include <csignal>
 #include <cstdint>
@@ -610,6 +611,7 @@ private:
     // passes, preventing stale motion commands from firing before the gripper
     // finishes its calibration stroke.
     std::map<ModbusRtu*, std::chrono::steady_clock::time_point> init_wait_map_;
+    std::mutex init_wait_mutex_;  // guards init_wait_map_ (written by bg poll thread)
     // Per-port regular-init (val=1) guard duration in ms.
     // AG-160 (160 mm stroke) needs ~5500 ms; CGC-80 (95 mm) needs ~3500 ms.
     std::map<ModbusRtu*, int> port_init_wait_ms_;
@@ -654,67 +656,80 @@ private:
                 std::cout << "  ⚠ No port configured for slave_id=" << (int)dds_slave << "\n";
             } else {
                 // Per-port init calibration window check
-                auto it = init_wait_map_.find(bus);
-                if (it != init_wait_map_.end()) {
-                    if (std::chrono::steady_clock::now() < it->second) {
-                        std::cout << "  ⏳ " << bus->port() << " still calibrating, skipping\n";
+                {
+                    std::unique_lock<std::mutex> lk(init_wait_mutex_);
+                    auto it = init_wait_map_.find(bus);
+                    if (it != init_wait_map_.end()) {
+                        if (std::chrono::steady_clock::now() < it->second) {
+                            lk.unlock();
+                            std::cout << "  ⏳ " << bus->port() << " still calibrating, skipping\n";
+                            goto next_write_sample;  // NOLINT — skip the write below
+                        } else {
+                            init_wait_map_.erase(it);
+                            lk.unlock();
+                            std::cout << "  [init] " << bus->port()
+                                      << " calibration complete, ready for motion\n" << std::flush;
+                        }
                     } else {
-                        std::cout << "  [init] " << bus->port()
-                                  << " calibration complete, ready for motion\n" << std::flush;
-                        init_wait_map_.erase(it);
-                        std::cout << "  → " << bus->port() << "  modbus_addr=" << (int)wire_addr << "\n";
-                        bus->write_register(wire_addr, reg, val, 0);
+                        lk.unlock();
                     }
-                } else {
-                    std::cout << "  → " << bus->port() << "  modbus_addr=" << (int)wire_addr << "\n";
-                    bus->write_register(wire_addr, reg, val, 0);
-
-                    // Poll for init_state=2 after init command, then set a short
-                    // residual guard.  This mirrors what the QNC Python helper does
-                    // and eliminates the unpredictable hardcoded wait duration.
+                }
+                std::cout << "  → " << bus->port() << "  modbus_addr=" << (int)wire_addr << "\n";
+                bus->write_register(wire_addr, reg, val, 0);
+                {
+                    // On init command: arm a guard then launch a background thread
+                    // that polls FC04 init_state until confirmed ready (init_state==2).
+                    // The background thread shrinks the guard to 500 ms once
+                    // confirmed, so motion writes queued behind init don't need to
+                    // wait for the full max_ms.  Using a detached thread keeps
+                    // drain_write_commands() non-blocking so the DDS queue stays
+                    // drained while the gripper calibrates.
                     if (reg == 0x0100 && (val == 1 || val == 165)) {
                         auto it_ms = port_init_wait_ms_.find(bus);
                         const int max_ms = (it_ms != port_init_wait_ms_.end())
                                            ? it_ms->second
                                            : (val == 165 ? 12000 : 10000);
 
-                        // Arm a large guard upfront; shrunk once polling confirms.
-                        init_wait_map_[bus] = std::chrono::steady_clock::now()
-                                             + std::chrono::milliseconds(max_ms);
-                        std::cout << "  [init] " << bus->port()
-                                  << " calibration started — polling FC04 init_state"
-                                  << " (timeout " << max_ms << " ms)...\n" << std::flush;
-
-                        // Inline blocking poll — acceptable: init is a one-time
-                        // synchronous step; no motion commands should fire during it.
-                        const auto poll_end = std::chrono::steady_clock::now()
-                                             + std::chrono::milliseconds(max_ms - 500);
-                        bool confirmed = false;
-                        while (std::chrono::steady_clock::now() < poll_end) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                            std::vector<uint16_t> st;
-                            if (bus->read_input_registers(wire_addr, 0x0200, 1, st, 600)
-                                    && !st.empty() && st[0] == 2) {
-                                confirmed = true;
-                                break;
-                            }
-                        }
-
-                        if (confirmed) {
-                            std::cout << "  [init] ✓ " << bus->port()
-                                      << " init_state=2 — releasing guard (500 ms flush)\n"
-                                      << std::flush;
-                            // Shrink guard to 500 ms just to flush any stale DDS queue
+                        {
+                            std::lock_guard<std::mutex> lk(init_wait_mutex_);
                             init_wait_map_[bus] = std::chrono::steady_clock::now()
-                                                 + std::chrono::milliseconds(500);
-                        } else {
-                            std::cout << "  [init] ⚠ " << bus->port()
-                                      << " init_state=2 not confirmed — keeping "
-                                      << max_ms << " ms guard\n" << std::flush;
+                                                 + std::chrono::milliseconds(max_ms);
                         }
+                        std::cout << "  [init] " << bus->port()
+                                  << " calibration started — background-polling FC04"
+                                  << " init_state (max " << max_ms << " ms)...\n"
+                                  << std::flush;
+
+                        const uint8_t poll_addr = wire_addr;
+                        auto* map_ptr   = &init_wait_map_;
+                        auto* mutex_ptr = &init_wait_mutex_;
+                        std::thread([bus, poll_addr, max_ms, map_ptr, mutex_ptr]() {
+                            const auto poll_end = std::chrono::steady_clock::now()
+                                                 + std::chrono::milliseconds(max_ms - 500);
+                            while (std::chrono::steady_clock::now() < poll_end) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+                                std::vector<uint16_t> st;
+                                if (bus->read_input_registers(poll_addr, 0x0200, 1, st, 700)
+                                        && !st.empty() && st[0] == 2) {
+                                    std::cout << "  [init] \u2713 " << bus->port()
+                                              << " init_state=2 confirmed"
+                                              << " \u2014 releasing guard (500 ms flush)\n"
+                                              << std::flush;
+                                    std::lock_guard<std::mutex> lg(*mutex_ptr);
+                                    (*map_ptr)[bus] = std::chrono::steady_clock::now()
+                                                     + std::chrono::milliseconds(500);
+                                    return;
+                                }
+                            }
+                            std::cout << "  [init] \u26a0 " << bus->port()
+                                      << " init_state=2 not confirmed within "
+                                      << max_ms << " ms \u2014 guard expires naturally\n"
+                                      << std::flush;
+                        }).detach();
                     }
                 }
             }
+            next_write_sample:
 
             if (tx_count_ % static_cast<uint64_t>(stats_interval_) == 0)
                 publish_stats("periodic");
