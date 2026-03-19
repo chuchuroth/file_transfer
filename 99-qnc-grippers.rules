@@ -1,0 +1,29 @@
+# /etc/udev/rules.d/99-qnc-grippers.rules
+#
+# Stable device symlinks for QNC gripper RS485 adapters (Pi CM5).
+# Keyed by FTDI FT232R chip serial number so the mapping survives USB
+# port swaps, kernel ttyUSB re-numbering, and reboots.
+#
+# FTDI serial numbers (verified on Pi CM5):
+#   BG00SMUT  →  DH AG-160-95-W-S  (parallel gripper,  160 mm stroke)
+#   B001PRSH  →  DH CGC-80         (concentric gripper,  95 mm stroke)
+#   BG011K9H  →  DH-5-6            (5-finger / 6-DOF dexterous hand)
+#
+# Verify live serials with:
+#   udevadm info /dev/ttyUSB0 | grep ID_SERIAL_SHORT
+#   udevadm info /dev/ttyUSB1 | grep ID_SERIAL_SHORT
+#   udevadm info /dev/ttyUSB2 | grep ID_SERIAL_SHORT
+#
+# Deploy:
+#   sudo cp scripts/99-qnc-grippers.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   ls -la /dev/gripper_ag160 /dev/gripper_cgc80 /dev/gripper_dh56
+#
+# qnc_bridge defaults:
+#   QNC_SERIAL_PORT   /dev/gripper_ag160
+#   QNC_SERIAL_PORT_2 /dev/gripper_cgc80
+#   QNC_SERIAL_PORT_3 /dev/gripper_dh56
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="BG00SMUT", SYMLINK+="gripper_ag160", MODE="0666"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="B001PRSH", SYMLINK+="gripper_cgc80", MODE="0666"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="BG011K9H", SYMLINK+="gripper_dh56",  MODE="0666"
