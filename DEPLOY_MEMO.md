@@ -1059,6 +1059,171 @@ cd build
 
 ---
 
+## Bug 7 — AG-160 never moves via DDS path despite CGC-80 working (diagnosed and fixed 2026-03-19)
+
+### 7a — Wrong FTDI adapter symlinked to `/dev/gripper_ag160` (Pi CM5) ✓ fixed 2026-03-19
+
+**Symptom:** Every FC04 status read to AG-160 returned `err=-2` (timeout — no response
+from device).  CGC-80 and DH-5-6 both responded normally.  DDS delivery was confirmed
+correct (bridge `tx` counts incremented for slave=1).
+
+**Root cause:** The udev rule entry for `BG00SMUT` pointed `/dev/gripper_ag160` to the
+wrong physical ttyUSB node — the adapter physically cabled to AG-160 had a different
+FTDI serial number in the installed rules file.  The bridge opened the wrong port and
+the AG-160 never saw any RS485 frames.
+
+**Diagnosis path:**
+```bash
+# On Pi CM5 — identify which serial is on which physical device
+udevadm info /dev/ttyUSB0 | grep ID_SERIAL_SHORT
+udevadm info /dev/ttyUSB1 | grep ID_SERIAL_SHORT
+udevadm info /dev/ttyUSB2 | grep ID_SERIAL_SHORT
+# Compare against /etc/udev/rules.d/99-qnc-grippers.rules
+```
+
+**Fix:** Corrected the FTDI serial-to-symlink mapping in
+`/etc/udev/rules.d/99-qnc-grippers.rules` on the Pi CM5 and reloaded:
+```bash
+sudo udevadm control --reload-rules && sudo udevadm trigger
+ls -la /dev/gripper_ag160 /dev/gripper_cgc80 /dev/gripper_dh56
+```
+After correction AG-160 responded immediately to the startup FC04 probe.
+
+The rules template in `scripts/99-qnc-grippers.rules` records the three confirmed
+FTDI serials:
+
+| Symlink | FTDI serial | Gripper |
+|---------|-------------|---------|
+| `/dev/gripper_ag160` | `BG00SMUT` | DH AG-160-95-W-S |
+| `/dev/gripper_cgc80` | `B001PRSH` | DH CGC-80 |
+| `/dev/gripper_dh56`  | `BG011K9H` | DH-5-6 |
+
+> **Verification step (add to every bring-up):** after installing/updating udev
+> rules, run the bridge once and check that the startup probe prints `RESPOND` for
+> every port before sending any motion commands.
+
+---
+
+### Bug 8 — Motion writes discarded because init guard expires before AG-160 calibration completes (fixed 2026-03-19)
+
+**Symptom:** Even with the correct port, AG-160 never moved via DDS.  With
+`--delay 14000` (sending motion at t=14 s, well after the 12 s guard) the gripper
+still did not move.
+
+**Root cause (two interacting issues):**
+
+1. **Inline blocking FC04 poll held up the DDS queue** (prior bug, since removed):
+   an earlier implementation polled `init_state` synchronously inside
+   `drain_write_commands()` for up to 12 s.  This prevented the loop from
+   dequeuing motion writes that arrived during the poll.  After the poll ended
+   the now-active guard discarded the buffered writes.
+
+2. **Fixed-duration guard too short for AG-160's 160 mm stroke**: the 12 s
+   guard expired before the AG-160 finished calibration (~15–20 s observed).
+   Motion writes sent after the guard cleared arrived at the gripper while
+   `init_state=1` (still calibrating) — the firmware silently ignores position
+   commands in that state.  After execution the DDS queue was empty; no writes
+   remained to retry.
+
+**Fix applied to `deploy_on_qnc/qnc_bridge.cpp`:**
+
+| Change | Detail |
+|--------|--------|
+| Per-port `init_wait_map_` | Replaced single global guard with `std::map<ModbusRtu*, time_point>` per port |
+| Background FC04 poll thread | Detached thread polls `init_state` every 400 ms via FC04; on `init_state=2` shrinks guard to `now + 500 ms` without blocking `drain_write_commands()` |
+| Thread-safe map writes | `std::mutex init_wait_mutex_` protects `init_wait_map_` and `pending_writes_map_` shared between main and background thread |
+| **Buffer-and-replay** | Instead of discarding writes during the guard, stores `{reg, val}` pairs in `pending_writes_map_[bus]`; replays the full set (in order) the moment the guard clears — either inline when the next DDS sample arrives, or via the post-loop flush path when no further sample comes |
+| Post-loop expired-guard flush | Every `drain_write_commands()` call checks for naturally-expired guards after the DDS sample loop; replays any pending writes immediately |
+| AG-160 max guard extended | Default `init_wait_ms1` raised from 12 000 → **30 000 ms** to cover the full 160 mm stroke; background FC04 thread shortens it as soon as `init_state=2` is confirmed |
+
+**Effective timeline post-fix (default `--delay 2500`):**
+```
+t=0 s     init FC06 → bridge arms 30 s guard, bg thread starts polling FC04
+t=2.5 s   close (force + speed + pos=1000) → buffered in pending_writes_map_
+t=5 s     status FC04 → err=-2  (AG-160 silent during calibration stroke — expected)
+t=7.5 s   open (force + speed + pos=0)   → buffered (6 writes total pending)
+t=~18 s   AG-160 calibration complete:
+              • bg thread sees init_state=2 → shrinks guard to now+500 ms
+              • OR guard expires naturally at t=30 s
+t=~18.5 s post-loop flush fires → replays 6 buffered writes → AG-160 moves ✓
+```
+
+AG-160 physical close/open motion confirmed after fix.
+
+---
+
+## Bug 9 — CGC-80 speed register address wrong (fixed earlier, documented here)
+
+**Symptom:** CGC-80 moved but speed commands had no effect.
+
+**Root cause:** AG-160 speed register is `0x0102` (258); CGC-80 speed register is
+`0x0104` (260) per `DH-Robotics_CGC-80_RTU.json`.  Code was using `0x0102` for
+both.
+
+**Fix:** All four dispatch paths in `gripper_control.cpp` now select the correct
+register:
+```cpp
+const uint16_t speed_reg = is_ag160 ? 0x0102 : 0x0104;
+```
+
+---
+
+## Demo results (2026-03-19) — all three grippers via DDS, 10 cycles each
+
+**Hardware under test:**
+- DH AG-160-95-W-S → `/dev/gripper_ag160` (FTDI `BG00SMUT`, slave=1, Modbus wire addr 1)
+- DH CGC-80         → `/dev/gripper_cgc80` (FTDI `B001PRSH`, slave=2, Modbus wire addr 1)
+- DH-5-6 hand       → `/dev/gripper_dh56`  (FTDI `BG011K9H`, slave=3, Modbus wire addr 1)
+
+**Test procedure:** `demo_all` command — inits all three grippers simultaneously,
+waits 25 s for calibration to complete, then runs 10 synchronized open/close cycles
+across all three devices from a single command on the robot computer.
+
+**Build (robot computer):**
+```bash
+cmake --build build --target gripper_control_dds
+```
+
+**Run command:**
+```bash
+# On Pi CM5 (start first):
+QNC_DE_RE_GPIO=none ./qnc_bridge   # (udev symlinks installed, no env overrides needed)
+
+# On robot computer:
+export FASTRTPS_DEFAULT_PROFILES_FILE=~/fastdds_unicast.xml
+./build/gripper_control_dds demo_all 10
+```
+
+**Result: PASS — all three grippers, 10/10 cycles each**
+
+| Gripper | Slave | Close command | Open command | Cycles | Result |
+|---------|-------|---------------|--------------|--------|--------|
+| AG-160 | 1 | FC06 reg=0x0103 val=1000 | FC06 reg=0x0103 val=0 | 10/10 | ✓ PASS |
+| CGC-80 | 2 | FC06 reg=0x0103 val=1000 | FC06 reg=0x0103 val=0 | 10/10 | ✓ PASS |
+| DH-5-6 | 3 | FC06 reg=0x0100 val=9 (HOME_ALL) | FC06 reg=0x0100 val=14 (THUMB_OPEN) | 10/10 | ✓ PASS |
+
+**DDS delivery confirmation (from robot console):**
+```
+[DDS] Bridge active on domain 0
+      topics: qnc/modbus/write_cmd | read_cmd | response | stats
+[DDS] Waiting for QNC bridge subscriber match... matched (200 ms)
+[demo_all] Sending init to all 3 grippers (AG-160 slave=1, CGC-80 slave=2, DH-5-6 slave=3)
+[demo_all] Waiting 25 s for calibration strokes......................... ready
+[demo_all 1/10] CLOSE/HOME ... done  OPEN ... done
+…
+[demo_all 10/10] CLOSE/HOME ... done  OPEN ... done
+[demo_all] Complete — 10 cycles across all 3 grippers
+```
+
+**Notes:**
+- `demo_all` default dwell is 4 000 ms per direction. Override with `--delay N`.
+- `demo_all N` accepts a cycle count; default is 10.
+- All writes go over independent RS485 buses — no inter-gripper bus collision possible.
+- DH-5-6 status reads during calibration return `err=-2` (device silent on bus during
+  calibration stroke); this is expected and logged by the bridge.
+
+---
+
 ## Workspace Layout
 
 Updated 2026-03-12 to reflect the two-machine architecture.
