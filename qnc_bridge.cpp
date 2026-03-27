@@ -43,31 +43,46 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <termios.h>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <linux/serial.h>
 
+#include <nlohmann/json.hpp>
+
+#include "modbus_rtu_common.hpp"
+
 // Generated from ModbusRTUBridge.idl (QNC-ICD-001 §7.1)
 #include "ModbusRTUBridge.hpp"
 #include "ModbusRTUBridgePubSubTypes.hpp"
-#include <fastdds/dds/domain/DomainParticipant.hpp>
-#include <fastdds/dds/domain/DomainParticipantFactory.hpp>
-#include <fastdds/dds/publisher/DataWriter.hpp>
-#include <fastdds/dds/publisher/Publisher.hpp>
-#include <fastdds/dds/subscriber/DataReader.hpp>
-#include <fastdds/dds/subscriber/SampleInfo.hpp>
-#include <fastdds/dds/subscriber/Subscriber.hpp>
-#include <fastdds/dds/topic/TypeSupport.hpp>
 
-using namespace eprosima::fastdds::dds;
+// Generated from Gripper*.idl
+#include "gripper/GripperCommand.hpp"
+#include "gripper/GripperCommandPubSubTypes.hpp"
+#include "gripper/GripperState.hpp"
+#include "gripper/GripperStatePubSubTypes.hpp"
+
+// NeuraSync abstraction layer (replaces raw FastDDS usage)
+#include <neura_sync/neura_sync_node.hpp>
+#include <neura_sync/participant_factory.hpp>
+#include <neura_sync/publisher.hpp>
+#include <neura_sync/publisher_factory.hpp>
+#include <neura_sync/subscriber.hpp>
+#include <neura_sync/subscriber_factory.hpp>
+
+// NeuraSync namespace alias
+namespace edds = eprosima::fastdds::dds;
+using json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
 // Signal handling
@@ -81,16 +96,7 @@ static void sig_handler(int) { g_running.store(false); }
 // Helpers
 // ---------------------------------------------------------------------------
 
-static uint16_t crc16(const uint8_t* data, size_t len)
-{
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; ++j)
-            crc = (crc & 0x0001) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-    }
-    return crc;
-}
+using modbus_rtu::crc16;
 
 static std::string iso_now()
 {
@@ -111,12 +117,11 @@ static std::string iso_now()
 // ModbusRtu
 //
 // Protocol-agnostic Modbus RTU master over RS485.
-// Supports any slave_id and any register address — does NOT hard-code
-// gripper-specific semantics; those live in the robot computer's JSON
-// descriptors (QNC-ICD-001 §1.4).
+// Inherits serial port, GPIO, framing, and transact from modbus_rtu::Base
+// (include/modbus_rtu_common.hpp).  Adds per-call slave_id write/read API.
 // ---------------------------------------------------------------------------
 
-class ModbusRtu {
+class ModbusRtu : public modbus_rtu::Base {
 public:
     /**
      * Open the serial port at 115200 8N1.
@@ -126,8 +131,8 @@ public:
      * @param de_re_gpio  sysfs GPIO number for the DE/RE line, or < 0 for auto
      */
     explicit ModbusRtu(const std::string& port, int de_re_gpio = -1)
-        : port_(port)
     {
+        port_ = port;
         fd_ = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
         if (fd_ < 0)
             throw std::runtime_error("Failed to open RS485 port: " + port);
@@ -136,7 +141,7 @@ public:
         if (de_re_gpio >= 0)
             setup_de_re_gpio(de_re_gpio);
 
-        std::cout << "✓ RS485 open: " << port << "\n";
+        std::cout << "\u2713 RS485 open: " << port << "\n";
     }
 
     ~ModbusRtu() { close(); }
@@ -157,7 +162,7 @@ public:
      * FC06 — Write Single Register.
      *
      * @param slave_id   Modbus slave address (1-247)
-     * @param reg_addr   Register address (0x0000–0xFFFF)
+     * @param reg_addr   Register address (0x0000-0xFFFF)
      * @param value      16-bit value to write
      * @param timeout_ms Response timeout in ms; 0 = fire-and-forget (no response read)
      * @returns true on success (or when fire_and_forget)
@@ -165,7 +170,6 @@ public:
     bool write_register(uint8_t slave_id, uint16_t reg_addr, uint16_t value,
                         int timeout_ms = 500)
     {
-        // FC06 PDU: [slave_id, 0x06, addr_hi, addr_lo, val_hi, val_lo]
         std::vector<uint8_t> pdu = {
             slave_id,
             0x06,
@@ -177,33 +181,21 @@ public:
         auto frame = build_frame(pdu);
 
         if (timeout_ms == 0) {
-            // Fire-and-forget: send frame and return immediately without waiting
-            // for the FC06 echo.  Mirrors the proven path in gripper_control.cpp
-            // (write_register with fire_and_forget=true).  tcflush(TCIOFLUSH) on
-            // the NEXT write clears any loopback echo bytes before they interfere.
             tcflush(fd_, TCIOFLUSH);
             de_re_tx();
-            ::write(fd_, frame.data(), frame.size());
-            tcdrain(fd_);   // block until last bit is physically transmitted
-            usleep(500);    // 0.5 ms guard: last stop bit fully clocked out
+            if (::write(fd_, frame.data(), frame.size()) < 0) { /* best effort */ }
+            tcdrain(fd_);
+            usleep(500);
             de_re_rx();
             return true;
         }
 
-        // FC06 echo response: 8 bytes identical to the request (Modbus spec §6.6)
         std::vector<uint8_t> resp = transact(frame, 8, timeout_ms);
         return validate_response(resp, slave_id, 0x06);
     }
 
     /**
      * FC04 — Read Input Registers.
-     *
-     * @param slave_id   Modbus slave address (1-247)
-     * @param start_reg  First register address
-     * @param count      Number of registers to read (1-125)
-     * @param out        Populated with register values on success
-     * @param timeout_ms Response timeout in ms
-     * @returns true on success, false on timeout / CRC error / exception
      */
     bool read_input_registers(uint8_t slave_id, uint16_t start_reg,
                                uint16_t count, std::vector<uint16_t>& out,
@@ -214,7 +206,6 @@ public:
 
     /**
      * FC03 — Read Holding Registers.
-     * Same framing as FC04 but for read/write holding registers.
      */
     bool read_holding_registers(uint8_t slave_id, uint16_t start_reg,
                                  uint16_t count, std::vector<uint16_t>& out,
@@ -236,7 +227,6 @@ private:
         };
         auto frame = build_frame(pdu);
 
-        // Response: [slave_id, fc, byte_count, data..., crc_lo, crc_hi]
         size_t expected = 3 + count * 2 + 2;
         std::vector<uint8_t> resp = transact(frame, expected, timeout_ms);
 
@@ -252,148 +242,224 @@ private:
                           | resp[4 + i*2]);
         return true;
     }
+};
 
-    int         fd_       = -1;
-    int         de_re_fd_ = -1;
-    std::string port_;
+struct RegisterRef {
+    uint16_t address{0};
+    uint8_t fc{6};
+};
 
-    // --- Serial port --------------------------------------------------------
+struct ScaleRule {
+    double raw_min{0.0};
+    double raw_max{1.0};
+    bool invert{false};
+};
 
-    void configure_port()
+struct GripperDescriptor {
+    std::string device_id;
+    uint8_t slave_id{1};
+    bool supports_force_control{false};
+    bool supports_speed_control{false};
+    bool has_multi_joint{false};
+
+    RegisterRef position_write;
+    RegisterRef position_read;
+    RegisterRef status_motion;
+    RegisterRef status_grasp;
+    RegisterRef status_fault;
+
+    std::vector<RegisterRef> force_write;
+    std::vector<RegisterRef> speed_write;
+
+    ScaleRule position_scale;
+    ScaleRule force_scale;
+    ScaleRule speed_scale;
+};
+
+class DescriptorLoader {
+public:
+    static std::map<std::string, GripperDescriptor> load(const std::string& path)
     {
-        termios tty{};
-        if (tcgetattr(fd_, &tty) != 0)
-            throw std::runtime_error("tcgetattr failed");
+        std::ifstream ifs(path);
+        if (!ifs.is_open()) {
+            throw std::runtime_error("Failed to open gripper descriptor: " + path);
+        }
+        json j;
+        ifs >> j;
 
-        cfsetospeed(&tty, B115200);
-        cfsetispeed(&tty, B115200);
+        GripperDescriptor d;
+        d.device_id = j.at("device").at("device_id").get<std::string>();
+        d.slave_id = static_cast<uint8_t>(j.at("device").at("slave_id").get<int>());
 
-        tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-        tty.c_cflag &= ~PARENB;
-        tty.c_cflag &= ~CSTOPB;
-        tty.c_cflag &= ~CRTSCTS;
-        tty.c_cflag |= CREAD | CLOCAL;
-        tty.c_iflag  = 0;
-        tty.c_oflag  = 0;
-        tty.c_lflag  = 0;
-        tty.c_cc[VMIN]  = 0;
-        tty.c_cc[VTIME] = 0;
+        const auto& caps = j.at("capabilities");
+        d.supports_force_control = caps.at("supports_force_control").get<bool>();
+        d.supports_speed_control = caps.at("supports_speed_control").get<bool>();
+        d.has_multi_joint = caps.at("has_multi_joint").get<bool>();
 
-        if (tcsetattr(fd_, TCSANOW, &tty) != 0)
-            throw std::runtime_error("tcsetattr failed");
+        const auto& regs = j.at("register_map");
+        d.position_write = parse_reg(regs.at("position").at("write").at(0));
+        d.position_read = parse_reg(regs.at("position").at("read").at(0));
+        d.status_motion = parse_reg(regs.at("status").at("motion"));
+        d.status_grasp = parse_reg(regs.at("status").at("grasp"));
+        if (regs.at("status").contains("fault")) {
+            d.status_fault = parse_reg(regs.at("status").at("fault"));
+        }
+
+        if (regs.contains("force") && regs.at("force").contains("write")) {
+            for (const auto& r : regs.at("force").at("write")) {
+                d.force_write.push_back(parse_reg(r));
+            }
+        }
+        if (regs.contains("speed") && regs.at("speed").contains("write")) {
+            for (const auto& r : regs.at("speed").at("write")) {
+                d.speed_write.push_back(parse_reg(r));
+            }
+        }
+
+        const auto& sc = j.at("scaling");
+        d.position_scale = parse_scale(sc.at("position"));
+        d.force_scale = parse_scale(sc.at("force"));
+        d.speed_scale = parse_scale(sc.at("speed"));
+
+        return {{d.device_id, d}};
     }
 
-    // --- DE/RE GPIO (sysfs legacy) ------------------------------------------
-
-    void setup_de_re_gpio(int sysfs_num)
+private:
+    static RegisterRef parse_reg(const json& j)
     {
-        { int efd = ::open("/sys/class/gpio/export", O_WRONLY);
-          if (efd >= 0) {
-              std::string s = std::to_string(sysfs_num);
-              ::write(efd, s.c_str(), s.size());
-              ::close(efd);
-          }}
-        usleep(50000);
-
-        std::string dir_path = "/sys/class/gpio/gpio"
-                               + std::to_string(sysfs_num) + "/direction";
-        int dfd = ::open(dir_path.c_str(), O_WRONLY);
-        if (dfd < 0) {
-            std::cerr << "⚠ Cannot open GPIO" << sysfs_num
-                      << " direction — DE/RE uncontrolled\n";
-            return;
-        }
-        ::write(dfd, "out", 3);
-        ::close(dfd);
-
-        std::string val_path = "/sys/class/gpio/gpio"
-                               + std::to_string(sysfs_num) + "/value";
-        de_re_fd_ = ::open(val_path.c_str(), O_WRONLY);
-        if (de_re_fd_ < 0) {
-            std::cerr << "⚠ Cannot open GPIO" << sysfs_num
-                      << " value — DE/RE uncontrolled\n";
-            return;
-        }
-        ::write(de_re_fd_, "0", 1);  // start in RX mode
-        std::cout << "✓ DE/RE GPIO" << sysfs_num << " active\n";
+        RegisterRef r;
+        r.address = static_cast<uint16_t>(j.at("address").get<int>());
+        r.fc = static_cast<uint8_t>(j.at("fc").get<int>());
+        return r;
     }
 
-    void de_re_tx() { if (de_re_fd_ >= 0) ::pwrite(de_re_fd_, "1", 1, 0); }
-    void de_re_rx() { if (de_re_fd_ >= 0) ::pwrite(de_re_fd_, "0", 1, 0); }
-
-    // --- Modbus RTU framing -------------------------------------------------
-
-    static std::vector<uint8_t> build_frame(const std::vector<uint8_t>& pdu)
+    static ScaleRule parse_scale(const json& j)
     {
-        auto frame = pdu;
-        uint16_t crc = crc16(frame.data(), frame.size());
-        frame.push_back(crc & 0xFF);
-        frame.push_back((crc >> 8) & 0xFF);
-        return frame;
+        ScaleRule s;
+        s.raw_min = j.at("raw_min").get<double>();
+        s.raw_max = j.at("raw_max").get<double>();
+        if (j.contains("invert")) {
+            s.invert = j.at("invert").get<bool>();
+        }
+        return s;
+    }
+};
+
+class CommandMapper {
+public:
+    static std::vector<qnc::modbus::WriteMultipleCommand> map(
+        const qnc::gripper::GripperCommand& cmd,
+        const GripperDescriptor& d)
+    {
+        const auto [ovr_pos, ovr_force, ovr_speed] = parse_overrides(cmd.tag().c_str());
+        const float pos = static_cast<float>(clamp01(ovr_pos.value_or(cmd.position())));
+        const float force = static_cast<float>(clamp01(ovr_force.value_or(cmd.max_force())));
+        const float speed = static_cast<float>(clamp01(ovr_speed.value_or(cmd.max_speed())));
+
+        std::vector<qnc::modbus::WriteMultipleCommand> out;
+        out.push_back(make_wmc(d, d.position_write, to_raw(pos, d.position_scale), cmd));
+
+        if (d.supports_force_control) {
+            for (const auto& reg : d.force_write) {
+                out.push_back(make_wmc(d, reg, to_raw(force, d.force_scale), cmd));
+            }
+        }
+        if (d.supports_speed_control) {
+            for (const auto& reg : d.speed_write) {
+                out.push_back(make_wmc(d, reg, to_raw(speed, d.speed_scale), cmd));
+            }
+        }
+        return out;
     }
 
-    std::vector<uint8_t> transact(const std::vector<uint8_t>& frame,
-                                  size_t max_bytes,
-                                  int timeout_ms = 1000)
+private:
+    static qnc::modbus::WriteMultipleCommand make_wmc(
+        const GripperDescriptor& d,
+        const RegisterRef& reg,
+        uint16_t value,
+        const qnc::gripper::GripperCommand& cmd)
     {
-        tcflush(fd_, TCIOFLUSH);
-        de_re_tx();
-        if (::write(fd_, frame.data(), frame.size()) < 0) {
-            de_re_rx();
-            return {};
-        }
-        tcdrain(fd_);
-        usleep(500);
-        de_re_rx();
-
-        std::vector<uint8_t> response;
-        response.reserve(max_bytes);
-
-        auto deadline = std::chrono::steady_clock::now()
-                        + std::chrono::milliseconds(timeout_ms);
-
-        while (response.size() < max_bytes) {
-            auto now       = std::chrono::steady_clock::now();
-            auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
-                                 deadline - now).count();
-            if (remaining <= 0) break;
-
-            struct timeval tv;
-            tv.tv_sec  = remaining / 1'000'000;
-            tv.tv_usec = remaining % 1'000'000;
-
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(fd_, &rfds);
-
-            int sel = ::select(fd_ + 1, &rfds, nullptr, nullptr, &tv);
-            if (sel <= 0) break;
-
-            uint8_t tmp[256];
-            ssize_t n = ::read(fd_, tmp,
-                               std::min(sizeof(tmp), max_bytes - response.size()));
-            if (n > 0)
-                response.insert(response.end(), tmp, tmp + n);
-        }
-        return response;
+        qnc::modbus::WriteMultipleCommand w;
+        w.slave_id(d.slave_id);
+        w.start_register(reg.address);
+        w.values({value});
+        w.timeout_ms(cmd.timeout() > 0.0f ? static_cast<uint32_t>(cmd.timeout() * 1000.0f) : 500);
+        w.tag(cmd.tag().c_str());
+        w.timestamp(iso_now().c_str());
+        return w;
     }
 
-    static bool validate_response(const std::vector<uint8_t>& resp,
-                                   uint8_t expected_id, uint8_t expected_fc)
+    static uint16_t to_raw(float norm, const ScaleRule& s)
     {
-        if (resp.size() < 4) return false;
-        if (resp[0] != expected_id) return false;
-        if (resp[1] == (expected_fc | 0x80)) {
-            std::cerr << "  Modbus exception 0x" << std::hex
-                      << static_cast<int>(resp[2]) << std::dec << "\n";
-            return false;
-        }
-        if (resp[1] != expected_fc) return false;
+        const double n = s.invert ? (1.0 - clamp01(norm)) : clamp01(norm);
+        return static_cast<uint16_t>(s.raw_min + n * (s.raw_max - s.raw_min));
+    }
 
-        size_t len     = resp.size();
-        uint16_t r_crc = resp[len-2] | (resp[len-1] << 8);
-        uint16_t c_crc = crc16(resp.data(), len - 2);
-        return r_crc == c_crc;
+    static double clamp01(double v)
+    {
+        return std::max(0.0, std::min(1.0, v));
+    }
+
+    // Assumption: GripperCommand has no dedicated JSON payload field, so
+    // advanced overrides are optionally encoded in `tag` as a JSON object.
+    static std::tuple<std::optional<float>, std::optional<float>, std::optional<float>>
+    parse_overrides(const std::string& tag)
+    {
+        if (tag.empty() || tag.front() != '{') {
+            return {std::nullopt, std::nullopt, std::nullopt};
+        }
+        try {
+            json j = json::parse(tag);
+            std::optional<float> p, f, s;
+            if (j.contains("position")) p = j.at("position").get<float>();
+            if (j.contains("force")) f = j.at("force").get<float>();
+            if (j.contains("speed")) s = j.at("speed").get<float>();
+            return {p, f, s};
+        } catch (...) {
+            return {std::nullopt, std::nullopt, std::nullopt};
+        }
+    }
+};
+
+class StateMapper {
+public:
+    static qnc::gripper::GripperState map(
+        const GripperDescriptor& d,
+        uint16_t raw_pos,
+        uint16_t raw_motion,
+        uint16_t raw_grasp,
+        int32_t err,
+        uint32_t latency_us,
+        const std::string& tag)
+    {
+        qnc::gripper::GripperState st;
+        st.device_id(d.device_id.c_str());
+        st.position(static_cast<float>(to_norm(raw_pos, d.position_scale)));
+        st.force(0.0f);
+        st.speed(0.0f);
+        st.status(err < 0
+            ? qnc::gripper::GripperStatus::STATUS_ERROR
+            : (raw_motion == 0 ? qnc::gripper::GripperStatus::STATUS_MOVING
+                               : qnc::gripper::GripperStatus::STATUS_IDLE));
+        st.grasp_result(raw_grasp == 2
+            ? qnc::gripper::GraspResult::GRASP_SUCCESS
+            : qnc::gripper::GraspResult::GRASP_IN_PROGRESS);
+        st.error_code(err);
+        st.message(err < 0 ? "modbus/read error" : "ok");
+        st.last_command_tag(tag.c_str());
+        st.last_command_latency_us(latency_us);
+        st.timestamp(iso_now());
+        return st;
+    }
+
+private:
+    static double to_norm(uint16_t raw, const ScaleRule& s)
+    {
+        const double denom = s.raw_max - s.raw_min;
+        if (denom == 0.0) return 0.0;
+        const double n = (static_cast<double>(raw) - s.raw_min) / denom;
+        const double out = s.invert ? (1.0 - n) : n;
+        return std::max(0.0, std::min(1.0, out));
     }
 };
 
@@ -435,7 +501,8 @@ public:
               int domain_id = 0, int stats_interval = 10,
               int init_wait_ms1 = 5500,   // AG-160: 160 mm stroke ~4.5 s calibration
               int init_wait_ms2 = 3500,   // CGC-80:  95 mm stroke ~2.5 s calibration
-              int init_wait_ms3 = 3500)   // DH-5-6
+              int init_wait_ms3 = 3500,   // DH-5-6
+              const std::string& gripper_descriptor = "")
         : modbus1_(modbus1), slave_id1_(slave_id1), modbus_addr1_(modbus_addr1),
           modbus2_(modbus2), slave_id2_(slave_id2), modbus_addr2_(modbus_addr2),
           modbus3_(modbus3), slave_id3_(slave_id3), modbus_addr3_(modbus_addr3),
@@ -445,57 +512,76 @@ public:
         if (modbus2_) port_init_wait_ms_[modbus2_] = init_wait_ms2;
         if (modbus3_) port_init_wait_ms_[modbus3_] = init_wait_ms3;
 
-        participant_ = DomainParticipantFactory::get_instance()
-                           ->create_participant(domain_id, PARTICIPANT_QOS_DEFAULT);
+        // Create DomainParticipant via NeuraSync ParticipantFactory
+        auto* part_factory = neura::sync::ParticipantFactory::getInstance();
+        participant_ = part_factory->createDefaultParticipant(domain_id);
         if (!participant_)
-            throw std::runtime_error("DDS: failed to create DomainParticipant");
+            throw std::runtime_error("NeuraSync: failed to create DomainParticipant");
 
-        // Register types
-        TypeSupport wc_type(new qnc::modbus::WriteCommandPubSubType());
-        TypeSupport rc_type(new qnc::modbus::ReadCommandPubSubType());
-        TypeSupport rsp_type(new qnc::modbus::ResponsePubSubType());
-        TypeSupport bs_type(new qnc::modbus::BridgeStatsPubSubType());
-        wc_type.register_type(participant_);
-        rc_type.register_type(participant_);
-        rsp_type.register_type(participant_);
-        bs_type.register_type(participant_);
+        // NeuraSyncNode manages the lifecycle of all publishers/subscribers.
+        node_ = std::make_shared<neura::sync::NeuraSyncNode>(participant_);
 
-        // Topics
-        wc_topic_  = participant_->create_topic("qnc/modbus/write_cmd",
-                                                wc_type.get_type_name(), TOPIC_QOS_DEFAULT);
-        rc_topic_  = participant_->create_topic("qnc/modbus/read_cmd",
-                                                rc_type.get_type_name(), TOPIC_QOS_DEFAULT);
-        rsp_topic_ = participant_->create_topic("qnc/modbus/response",
-                                                rsp_type.get_type_name(), TOPIC_QOS_DEFAULT);
-        bs_topic_  = participant_->create_topic("qnc/modbus/stats",
-                                                bs_type.get_type_name(), TOPIC_QOS_DEFAULT);
+        auto pub_factory = neura::sync::PublisherFactory::getInstance(participant_);
+        auto sub_factory = neura::sync::SubscriberFactory::getInstance(participant_);
 
-        // Subscriber for incoming commands
-        subscriber_ = participant_->create_subscriber(SUBSCRIBER_QOS_DEFAULT);
-        // KEEP_LAST depth=10 so force+speed+position samples (3 per cycle) are
-        // never overwritten before drain_write_commands() takes them (Bug 2).
-        // TRANSIENT_LOCAL matches the robot-side DataWriter durability so that
-        // commands published before the bridge's DataReader is matched are
-        // cached by the writer and delivered once discovery completes.
-        // NOTE: durability is only effective when the matching DataWriter also
-        // declares TRANSIENT_LOCAL — see robot_side/src/gripper_control.cpp.
-        DataReaderQos cmd_qos = DATAREADER_QOS_DEFAULT;
-        cmd_qos.history().kind    = KEEP_LAST_HISTORY_QOS;
-        cmd_qos.history().depth   = 10;
-        cmd_qos.durability().kind = TRANSIENT_LOCAL_DURABILITY_QOS;
-        wc_reader_  = subscriber_->create_datareader(wc_topic_, cmd_qos);
-        rc_reader_  = subscriber_->create_datareader(rc_topic_, cmd_qos);
+        node_->add_subscriber(
+            sub_factory->createDefaultSubscriber<
+                qnc::modbus::ReadCommand, qnc::modbus::ReadCommandPubSubType>(
+                "rc_sub", "qnc/modbus/read_cmd",
+                [this](const qnc::modbus::ReadCommand& msg) {
+                    std::lock_guard<std::mutex> lk(cmd_mutex_);
+                    read_queue_.push_back(msg);
+                }));
 
-        // Publisher for responses and stats
-        publisher_  = participant_->create_publisher(PUBLISHER_QOS_DEFAULT);
-        rsp_writer_ = publisher_->create_datawriter(rsp_topic_, DATAWRITER_QOS_DEFAULT);
-        bs_writer_  = publisher_->create_datawriter(bs_topic_,  DATAWRITER_QOS_DEFAULT);
+        // Store wc_sub so wait_for_publisher_match() can access its DataReader.
+        wc_sub_ = sub_factory->createDefaultSubscriber<
+                qnc::modbus::WriteCommand, qnc::modbus::WriteCommandPubSubType>(
+                "wc_sub", "qnc/modbus/write_cmd",
+                [this](const qnc::modbus::WriteCommand& msg) {
+                    std::lock_guard<std::mutex> lk(cmd_mutex_);
+                    write_queue_.push_back(msg);
+                });
+        node_->add_subscriber(wc_sub_);
+
+        // Generic gripper command ingress on the fixed high-level topic.
+        node_->add_subscriber(
+            sub_factory->createDefaultSubscriber<
+                qnc::gripper::GripperCommand, qnc::gripper::GripperCommandPubSubType>(
+                "gc_sub", "qnc/gripper/command",
+                [this](const qnc::gripper::GripperCommand& msg) {
+                    std::lock_guard<std::mutex> lk(cmd_mutex_);
+                    gripper_cmd_queue_.push_back(msg);
+                }));
+
+        // Response and stats publishers: CriticalData profile (RELIABLE, SYNC).
+        constexpr int64_t max_blocking_ns = 500000000; // 500 ms
+        node_->add_publisher(
+            pub_factory->createCriticalDataPublisher<
+                qnc::modbus::Response, qnc::modbus::ResponsePubSubType>(
+                "rsp_pub", "qnc/modbus/response", max_blocking_ns));
+        node_->add_publisher(
+            pub_factory->createCriticalDataPublisher<
+                qnc::modbus::BridgeStats, qnc::modbus::BridgeStatsPubSubType>(
+                "bs_pub", "qnc/modbus/stats", max_blocking_ns));
+        node_->add_publisher(
+            pub_factory->createCriticalDataPublisher<
+                qnc::gripper::GripperState, qnc::gripper::GripperStatePubSubType>(
+                "gs_pub", "qnc/gripper/state", max_blocking_ns));
+
+        if (!gripper_descriptor.empty()) {
+            try {
+                gripper_descriptors_ = DescriptorLoader::load(gripper_descriptor);
+                std::cout << "[Bridge] Loaded gripper descriptor: " << gripper_descriptor << "\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[Bridge] gripper descriptor load failed: " << e.what() << "\n";
+            }
+        }
 
         start_time_ = std::chrono::steady_clock::now();
 
-        std::cout << "[DDS] QncBridge active on domain " << domain_id << "\n"
-                  << "      SUB: qnc/modbus/write_cmd  qnc/modbus/read_cmd\n"
-                  << "      PUB: qnc/modbus/response   qnc/modbus/stats\n";
+        std::cout << "[NeuraSync] QncBridge active on domain " << domain_id << "\n"
+                  << "      SUB: qnc/modbus/write_cmd  qnc/modbus/read_cmd  qnc/gripper/command\n"
+                  << "      PUB: qnc/modbus/response   qnc/modbus/stats     qnc/gripper/state\n";
         if (modbus1_)
             std::cout << "      RS485 port1 dds_slave_id=" << (int)slave_id1_
                       << "  modbus_wire_addr=" << (int)modbus_addr1_ << "\n";
@@ -509,18 +595,10 @@ public:
 
     ~QncBridge()
     {
-        if (subscriber_ && wc_reader_)  subscriber_->delete_datareader(wc_reader_);
-        if (subscriber_ && rc_reader_)  subscriber_->delete_datareader(rc_reader_);
-        if (publisher_  && rsp_writer_) publisher_->delete_datawriter(rsp_writer_);
-        if (publisher_  && bs_writer_)  publisher_->delete_datawriter(bs_writer_);
-        if (participant_ && subscriber_) participant_->delete_subscriber(subscriber_);
-        if (participant_ && publisher_)  participant_->delete_publisher(publisher_);
-        if (participant_ && wc_topic_)   participant_->delete_topic(wc_topic_);
-        if (participant_ && rc_topic_)   participant_->delete_topic(rc_topic_);
-        if (participant_ && rsp_topic_)  participant_->delete_topic(rsp_topic_);
-        if (participant_ && bs_topic_)   participant_->delete_topic(bs_topic_);
-        if (participant_)
-            DomainParticipantFactory::get_instance()->delete_participant(participant_);
+        // NeuraSyncNode destructor cleans up all publishers, subscribers,
+        // and associated DDS entities and participant ownership.
+        node_.reset();
+        participant_ = nullptr;
     }
 
     QncBridge(const QncBridge&) = delete;
@@ -536,10 +614,19 @@ public:
         const int poll_ms  = 100;
         int       elapsed  = 0;
         std::cout << "[Bridge] Waiting for robot publisher match..." << std::flush;
+
+        // Access the write_cmd subscriber's DataReader to check for matched
+        // publications (peer discovery).
+        auto sub_base = wc_sub_;
+        if (!sub_base || !sub_base->get_data_reader()) {
+            std::cout << " subscriber not found\n" << std::flush;
+            return false;
+        }
+
         while (elapsed < timeout_ms) {
-            std::vector<eprosima::fastdds::dds::InstanceHandle_t> handles;
-            wc_reader_->get_matched_publications(handles);
-            if (!handles.empty()) {
+            edds::SubscriptionMatchedStatus status;
+            sub_base->get_data_reader()->get_subscription_matched_status(status);
+            if (status.current_count > 0) {
                 std::cout << " matched (" << elapsed << " ms)\n" << std::flush;
                 return true;
             }
@@ -563,6 +650,7 @@ public:
             bool processed = false;
             processed |= drain_write_commands();
             processed |= drain_read_commands();
+            processed |= drain_gripper_commands();
 
             if (!processed)
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -575,18 +663,21 @@ public:
     }
 
 private:
-    // --- DDS plumbing -------------------------------------------------------
-    DomainParticipant* participant_ = nullptr;
-    Subscriber*        subscriber_  = nullptr;
-    Publisher*         publisher_   = nullptr;
-    Topic* wc_topic_  = nullptr;
-    Topic* rc_topic_  = nullptr;
-    Topic* rsp_topic_ = nullptr;
-    Topic* bs_topic_  = nullptr;
-    DataReader* wc_reader_  = nullptr;
-    DataReader* rc_reader_  = nullptr;
-    DataWriter* rsp_writer_ = nullptr;
-    DataWriter* bs_writer_  = nullptr;
+    // --- NeuraSync plumbing -------------------------------------------------
+    edds::DomainParticipant* participant_ = nullptr;
+    std::shared_ptr<neura::sync::NeuraSyncNode> node_;
+    std::shared_ptr<neura::sync::Subscriber<
+        qnc::modbus::WriteCommand, qnc::modbus::WriteCommandPubSubType>> wc_sub_;
+
+    // Callback→queue bridge: NeuraSync subscribers deliver messages via
+    // callbacks on the DDS listener thread. The queues buffer them for
+    // single-threaded serial processing in the main spin() loop.
+    std::mutex cmd_mutex_;
+    std::vector<qnc::modbus::WriteCommand> write_queue_;
+    std::vector<qnc::modbus::ReadCommand> read_queue_;
+    std::vector<qnc::gripper::GripperCommand> gripper_cmd_queue_;
+
+    std::map<std::string, GripperDescriptor> gripper_descriptors_;
 
     // --- State --------------------------------------------------------------
     ModbusRtu*  modbus1_      = nullptr;  // primary port
@@ -646,12 +737,16 @@ private:
 
     bool drain_write_commands()
     {
+        // Swap the callback queue under the lock, then process outside the
+        // lock so that new messages can keep arriving while we do serial I/O.
+        std::vector<qnc::modbus::WriteCommand> batch;
+        {
+            std::lock_guard<std::mutex> lk(cmd_mutex_);
+            batch.swap(write_queue_);
+        }
         bool any = false;
-        qnc::modbus::WriteCommand sample;
-        SampleInfo info;
 
-        while (wc_reader_->take_next_sample(&sample, &info) == RETCODE_OK) {
-            if (!info.valid_data) continue;
+        for (auto& sample : batch) {
             any = true;
 
             const uint8_t  dds_slave = static_cast<uint8_t>(sample.slave_id());
@@ -674,6 +769,19 @@ private:
                     auto it = init_wait_map_.find(bus);
                     if (it != init_wait_map_.end()) {
                         if (std::chrono::steady_clock::now() < it->second) {
+                            // Init commands (reg=0x0100) always bypass the guard: they reset
+                            // calibration, so the guard must be re-armed from scratch.
+                            // Discard any stale pending motion that was queued for the old
+                            // calibration window — it belongs to the previous robot session.
+                            if (reg == 0x0100 && (val == 1 || val == 165)) {
+                                pending_writes_map_.erase(bus);
+                                init_wait_map_.erase(it);
+                                lk.unlock();
+                                std::cout << "  [init] " << bus->port()
+                                          << " re-init during guard — resetting calibration\n"
+                                          << std::flush;
+                                // fall through to write_register + guard re-arm below
+                            } else {
                             pending_writes_map_[bus].emplace_back(reg, val);
                             lk.unlock();
                             std::cout << "  ⏳ " << bus->port()
@@ -681,6 +789,7 @@ private:
                                       << std::hex << std::setw(4) << std::setfill('0') << reg
                                       << " val=" << std::dec << val << "\n";
                             goto next_write_sample;  // NOLINT — write is buffered
+                            }
                         } else {
                             init_wait_map_.erase(it);
                             auto pit = pending_writes_map_.find(bus);
@@ -808,12 +917,14 @@ private:
 
     bool drain_read_commands()
     {
+        std::vector<qnc::modbus::ReadCommand> batch;
+        {
+            std::lock_guard<std::mutex> lk(cmd_mutex_);
+            batch.swap(read_queue_);
+        }
         bool any = false;
-        qnc::modbus::ReadCommand sample;
-        SampleInfo info;
 
-        while (rc_reader_->take_next_sample(&sample, &info) == RETCODE_OK) {
-            if (!info.valid_data) continue;
+        for (auto& sample : batch) {
             any = true;
 
             const uint8_t  slave = static_cast<uint8_t>(sample.slave_id());
@@ -857,13 +968,85 @@ private:
         return any;
     }
 
+    bool drain_gripper_commands()
+    {
+        std::vector<qnc::gripper::GripperCommand> batch;
+        {
+            std::lock_guard<std::mutex> lk(cmd_mutex_);
+            batch.swap(gripper_cmd_queue_);
+        }
+        bool any = false;
+
+        for (const auto& cmd : batch) {
+            any = true;
+            const std::string device_id(cmd.device_id().c_str());
+            auto dit = gripper_descriptors_.find(device_id);
+            if (dit == gripper_descriptors_.end()) {
+                std::cerr << "[Gripper] descriptor not found for device_id=" << device_id << "\n";
+                continue;
+            }
+            const auto& desc = dit->second;
+            auto [bus, wire_addr] = route(desc.slave_id);
+            if (!bus) {
+                std::cerr << "[Gripper] no route for slave_id=" << (int)desc.slave_id << "\n";
+                continue;
+            }
+
+            const auto writes = CommandMapper::map(cmd, desc);
+            for (const auto& w : writes) {
+                const uint16_t reg = w.start_register();
+                const uint16_t val = w.values().empty() ? 0 : w.values()[0];
+                bus->write_register(wire_addr, reg, val, 0);
+                ++tx_count_;
+            }
+
+            std::vector<uint16_t> pos_data;
+            std::vector<uint16_t> motion_data;
+            std::vector<uint16_t> grasp_data;
+            int32_t err = qnc::EC_SUCCESS;
+
+            const bool pos_ok = desc.position_read.fc == 4
+                ? bus->read_input_registers(wire_addr, desc.position_read.address, 1, pos_data, 800)
+                : bus->read_holding_registers(wire_addr, desc.position_read.address, 1, pos_data, 800);
+            const bool motion_ok = desc.status_motion.fc == 4
+                ? bus->read_input_registers(wire_addr, desc.status_motion.address, 1, motion_data, 800)
+                : bus->read_holding_registers(wire_addr, desc.status_motion.address, 1, motion_data, 800);
+            const bool grasp_ok = desc.status_grasp.fc == 4
+                ? bus->read_input_registers(wire_addr, desc.status_grasp.address, 1, grasp_data, 800)
+                : bus->read_holding_registers(wire_addr, desc.status_grasp.address, 1, grasp_data, 800);
+
+            if (!(pos_ok && motion_ok && grasp_ok)) {
+                err = qnc::EC_TIMEOUT;
+                ++err_count_;
+                last_err_ = err;
+            } else {
+                ++rx_count_;
+            }
+
+            const uint16_t raw_pos = pos_data.empty() ? 0 : pos_data[0];
+            const uint16_t raw_motion = motion_data.empty() ? 0 : motion_data[0];
+            const uint16_t raw_grasp = grasp_data.empty() ? 0 : grasp_data[0];
+
+            auto state = StateMapper::map(
+                desc,
+                raw_pos,
+                raw_motion,
+                raw_grasp,
+                err,
+                0,
+                std::string(cmd.tag().c_str()));
+            publish_gripper_state(state);
+        }
+        return any;
+    }
+
     // --- Publish helpers ----------------------------------------------------
 
     void publish_response_data(uint8_t slave, uint16_t start,
                                 const std::vector<uint16_t>& regs,
                                 long err_code, const std::string& tag)
     {
-        if (!rsp_writer_) return;
+        if (!node_) return;
         qnc::modbus::Response msg;
         msg.slave_id(slave);
         msg.start_register(start);
@@ -872,12 +1055,22 @@ private:
         msg.error_code(err_code);
         msg.tag(tag);
         msg.timestamp(iso_now());
-        rsp_writer_->write(&msg);
+        node_->set_publisher_buffer<qnc::modbus::Response,
+                                    qnc::modbus::ResponsePubSubType>("rsp_pub", msg);
+        node_->publish("rsp_pub");
+    }
+
+    void publish_gripper_state(const qnc::gripper::GripperState& state)
+    {
+        if (!node_) return;
+        node_->set_publisher_buffer<qnc::gripper::GripperState,
+                                    qnc::gripper::GripperStatePubSubType>("gs_pub", state);
+        node_->publish("gs_pub");
     }
 
     void publish_stats(const std::string& reason)
     {
-        if (!bs_writer_) return;
+        if (!node_) return;
         double uptime = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - start_time_).count();
         qnc::modbus::BridgeStats msg;
@@ -890,7 +1083,9 @@ private:
         msg.avg_latency_us(0);
         msg.uptime_seconds(uptime);
         msg.timestamp(iso_now());
-        bs_writer_->write(&msg);
+        node_->set_publisher_buffer<qnc::modbus::BridgeStats,
+                                    qnc::modbus::BridgeStatsPubSubType>("bs_pub", msg);
+        node_->publish("bs_pub");
         std::cout << "[Stats/" << reason << "] tx=" << tx_count_
                   << " rx=" << rx_count_ << " err=" << err_count_
                   << " uptime=" << static_cast<int>(uptime) << "s\n";
@@ -950,9 +1145,11 @@ int main()
     const char* env_iwait1   = std::getenv("QNC_INIT_WAIT_MS_1");
     const char* env_iwait2   = std::getenv("QNC_INIT_WAIT_MS_2");
     const char* env_iwait3   = std::getenv("QNC_INIT_WAIT_MS_3");
+    const char* env_gdesc    = std::getenv("QNC_GRIPPER_DESCRIPTOR");
     const int init_wait_ms1  = env_iwait1 ? std::atoi(env_iwait1) : 30000;  // AG-160: 160 mm stroke takes 15-20 s; bg FC04 poll shortens if confirmed sooner
     const int init_wait_ms2  = env_iwait2 ? std::atoi(env_iwait2) : 8000;   // CGC-80: max poll timeout
     const int init_wait_ms3  = env_iwait3 ? std::atoi(env_iwait3) : 8000;   // DH-5-6: max poll timeout
+    const std::string gripper_desc_path = env_gdesc ? env_gdesc : "";
 
     int gpio_num = -1;
     if (gpio_str != "none") {
@@ -980,7 +1177,8 @@ int main()
                   << "  init_wait=" << init_wait_ms3 << " ms)\n";
     std::cout << "  DE/RE GPIO   : " << gpio_str << "\n"
               << "  DDS domain   : " << domain_id << "\n"
-              << "  Stats interval: every " << stats_interval << " writes\n\n";
+              << "  Stats interval: every " << stats_interval << " writes\n"
+              << "  Gripper descriptor: " << (gripper_desc_path.empty() ? "<disabled>" : gripper_desc_path) << "\n\n";
 
     // --- Open RS485 port(s) -------------------------------------------------
     // Missing ports are non-fatal: bridge runs DDS-only and returns
@@ -1048,7 +1246,8 @@ int main()
                          modbus2.get(), slave_id2, modbus_addr2,
                          modbus3.get(), slave_id3, modbus_addr3,
                          domain_id, stats_interval,
-                         init_wait_ms1, init_wait_ms2, init_wait_ms3);
+                         init_wait_ms1, init_wait_ms2, init_wait_ms3,
+                         gripper_desc_path);
 
         // Wait for the robot platform's DDS publisher to be discovered before
         // declaring "Waiting for commands". This eliminates the race where
