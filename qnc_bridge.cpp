@@ -1,15 +1,13 @@
 /**
  * qnc_bridge.cpp
  *
- * QNC firmware bridge: subscribes to DDS commands from the robot computer,
- * forwards them to the RS485 field device (gripper / any Modbus RTU slave),
- * and publishes responses + stats back over DDS.
+ * QNC firmware bridge: subscribes to gripper commands from the robot computer,
+ * forwards them to RS485 field devices (Modbus RTU), and publishes gripper
+ * state feedback over DDS.
  *
- * DDS topics (QNC-ICD-001 §7.1):
- *   SUBSCRIBE  qnc/modbus/write_cmd  — FC06 write single register
- *   SUBSCRIBE  qnc/modbus/read_cmd   — FC04 read input registers
- *   PUBLISH    qnc/modbus/response   — result / register data
- *   PUBLISH    qnc/modbus/stats      — cumulative TX/RX/error counters
+ * DDS topics:
+ *   SUBSCRIBE  qnc/gripper/command
+ *   PUBLISH    qnc/gripper/state
  *
  * Environment variables:
  *   QNC_SERIAL_PORT      Primary RS485 device   (default: /dev/gripper_ag160)
@@ -24,7 +22,7 @@
  *   QNC_DE_RE_GPIO       sysfs GPIO number for DE/RE line, or "none"
  *                        (default: none — auto-direction XY-485 HAT)
  *   QNC_DOMAIN_ID        FastDDS domain id    (default: 0)
- *   QNC_STATS_INTERVAL   publish stats every N write ops (default: 10)
+ *   QNC_STATS_INTERVAL   print stats every N write ops (default: 10)
  *
  * Build:
  *   cmake -DBUILD_WITH_DDS=ON .. && cmake --build . -t qnc_bridge
@@ -47,6 +45,7 @@
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <termios.h>
@@ -61,10 +60,6 @@
 #include <nlohmann/json.hpp>
 
 #include "modbus_rtu_common.hpp"
-
-// Generated from ModbusRTUBridge.idl (QNC-ICD-001 §7.1)
-#include "ModbusRTUBridge.hpp"
-#include "ModbusRTUBridgePubSubTypes.hpp"
 
 // Generated from Gripper*.idl
 #include "gripper/GripperCommand.hpp"
@@ -83,6 +78,12 @@
 // NeuraSync namespace alias
 namespace edds = eprosima::fastdds::dds;
 using json = nlohmann::json;
+
+namespace {
+constexpr int32_t EC_SUCCESS = 0;
+constexpr int32_t EC_TIMEOUT = -2;
+constexpr int32_t EC_DISCONNECTED = -3;
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Signal handling
@@ -111,6 +112,38 @@ static std::string iso_now()
     char full[40];
     snprintf(full, sizeof(full), "%s.%03ldZ", buf, (long)ms.count());
     return full;
+}
+
+static std::string to_lower_copy(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static std::vector<std::string> descriptor_aliases(const std::string& raw_id)
+{
+    std::vector<std::string> out;
+    if (raw_id.empty()) {
+        return out;
+    }
+
+    const std::string id = to_lower_copy(raw_id);
+    out.push_back(id);
+
+    const std::string prefix = "gripper_";
+    if (id.rfind(prefix, 0) == 0) {
+        const std::string no_prefix = id.substr(prefix.size());
+        if (!no_prefix.empty()) {
+            out.push_back(no_prefix);
+        }
+    } else {
+        out.push_back(prefix + id);
+    }
+
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,12 +294,16 @@ struct GripperDescriptor {
     bool supports_force_control{false};
     bool supports_speed_control{false};
     bool has_multi_joint{false};
+    size_t dof_count{1};
 
-    RegisterRef position_write;
-    RegisterRef position_read;
+    std::vector<RegisterRef> position_write;
+    std::vector<RegisterRef> position_read;
     RegisterRef status_motion;
     RegisterRef status_grasp;
     RegisterRef status_fault;
+    uint16_t status_base{0};
+    uint16_t status_stride{1};
+    size_t status_dof_count{0};
 
     std::vector<RegisterRef> force_write;
     std::vector<RegisterRef> speed_write;
@@ -288,40 +325,141 @@ public:
         ifs >> j;
 
         GripperDescriptor d;
-        d.device_id = j.at("device").at("device_id").get<std::string>();
-        d.slave_id = static_cast<uint8_t>(j.at("device").at("slave_id").get<int>());
-
-        const auto& caps = j.at("capabilities");
-        d.supports_force_control = caps.at("supports_force_control").get<bool>();
-        d.supports_speed_control = caps.at("supports_speed_control").get<bool>();
-        d.has_multi_joint = caps.at("has_multi_joint").get<bool>();
-
-        const auto& regs = j.at("register_map");
-        d.position_write = parse_reg(regs.at("position").at("write").at(0));
-        d.position_read = parse_reg(regs.at("position").at("read").at(0));
-        d.status_motion = parse_reg(regs.at("status").at("motion"));
-        d.status_grasp = parse_reg(regs.at("status").at("grasp"));
-        if (regs.at("status").contains("fault")) {
-            d.status_fault = parse_reg(regs.at("status").at("fault"));
+        const auto& dev = j.at("device");
+        if (dev.contains("device_id")) {
+            d.device_id = dev.at("device_id").get<std::string>();
+        } else if (dev.contains("model")) {
+            d.device_id = dev.at("model").get<std::string>();
+        } else {
+            throw std::runtime_error("Descriptor missing device.device_id/model");
         }
 
-        if (regs.contains("force") && regs.at("force").contains("write")) {
-            for (const auto& r : regs.at("force").at("write")) {
-                d.force_write.push_back(parse_reg(r));
+        if (j.contains("connection") && j.at("connection").contains("slave_id")) {
+            d.slave_id = static_cast<uint8_t>(j.at("connection").at("slave_id").get<int>());
+        } else if (dev.contains("slave_id")) {
+            d.slave_id = static_cast<uint8_t>(dev.at("slave_id").get<int>());
+        }
+
+        if (j.contains("capabilities")) {
+            const auto& caps = j.at("capabilities");
+            d.supports_force_control = caps.value("supports_force_control", false);
+            d.supports_speed_control = caps.value("supports_speed_control", false);
+            d.has_multi_joint = caps.value("has_multi_joint", false);
+            d.dof_count = static_cast<size_t>(caps.value("joint_count", d.has_multi_joint ? 6 : 1));
+        }
+
+        // New schema: explicit joints[] array with per-DOF mappings.
+        if (j.contains("joints") && j.at("joints").is_array()) {
+            for (const auto& joint : j.at("joints")) {
+                if (joint.contains("position")) {
+                    if (joint.at("position").contains("write")) {
+                        d.position_write.push_back(parse_reg(joint.at("position").at("write")));
+                    }
+                    if (joint.at("position").contains("read")) {
+                        d.position_read.push_back(parse_reg(joint.at("position").at("read")));
+                    }
+                    if (joint.at("position").contains("scale")) {
+                        d.position_scale = parse_scale(joint.at("position").at("scale"));
+                    }
+                }
+
+                if (joint.contains("force") && joint.at("force").contains("write")) {
+                    d.force_write.push_back(parse_reg(joint.at("force").at("write")));
+                    if (joint.at("force").contains("scale")) {
+                        d.force_scale = parse_scale(joint.at("force").at("scale"));
+                    }
+                }
+
+                if (joint.contains("speed") && joint.at("speed").contains("write")) {
+                    d.speed_write.push_back(parse_reg(joint.at("speed").at("write")));
+                    if (joint.at("speed").contains("scale")) {
+                        d.speed_scale = parse_scale(joint.at("speed").at("scale"));
+                    }
+                }
+            }
+
+            if (j.contains("normalization")) {
+                const auto& norm = j.at("normalization");
+                if (norm.contains("position")) d.position_scale = parse_scale(norm.at("position"));
+                if (norm.contains("force")) d.force_scale = parse_scale(norm.at("force"));
+                if (norm.contains("speed")) d.speed_scale = parse_scale(norm.at("speed"));
+            }
+
+            if (j.contains("register_map") && j.at("register_map").contains("status")) {
+                const auto& st = j.at("register_map").at("status");
+                if (st.contains("joint_state") && st.at("joint_state").is_array() && !st.at("joint_state").empty()) {
+                    d.status_base = static_cast<uint16_t>(st.at("joint_state").at(0).at("address").get<int>());
+                    d.status_dof_count = st.at("joint_state").size();
+                    if (st.at("joint_state").size() > 1) {
+                        const int first = st.at("joint_state").at(0).at("address").get<int>();
+                        const int second = st.at("joint_state").at(1).at("address").get<int>();
+                        d.status_stride = static_cast<uint16_t>(std::max(1, second - first));
+                    }
+                    d.status_motion = parse_reg(st.at("joint_state").at(0));
+                    d.status_grasp = d.status_motion;
+                }
             }
         }
-        if (regs.contains("speed") && regs.at("speed").contains("write")) {
-            for (const auto& r : regs.at("speed").at("write")) {
-                d.speed_write.push_back(parse_reg(r));
+
+        // Legacy schema fallback.
+        if (d.position_write.empty() && j.contains("register_map")) {
+            const auto& regs = j.at("register_map");
+            if (regs.contains("position") && regs.at("position").contains("write")) {
+                for (const auto& r : regs.at("position").at("write")) {
+                    d.position_write.push_back(parse_reg(r));
+                }
+            }
+            if (regs.contains("position") && regs.at("position").contains("read")) {
+                for (const auto& r : regs.at("position").at("read")) {
+                    d.position_read.push_back(parse_reg(r));
+                }
+            }
+            if (regs.contains("status")) {
+                if (regs.at("status").contains("motion")) d.status_motion = parse_reg(regs.at("status").at("motion"));
+                if (regs.at("status").contains("grasp")) d.status_grasp = parse_reg(regs.at("status").at("grasp"));
+                if (regs.at("status").contains("fault")) d.status_fault = parse_reg(regs.at("status").at("fault"));
+            }
+
+            if (regs.contains("force") && regs.at("force").contains("write")) {
+                for (const auto& r : regs.at("force").at("write")) {
+                    d.force_write.push_back(parse_reg(r));
+                }
+            }
+            if (regs.contains("speed") && regs.at("speed").contains("write")) {
+                for (const auto& r : regs.at("speed").at("write")) {
+                    d.speed_write.push_back(parse_reg(r));
+                }
+            }
+
+            if (j.contains("scaling")) {
+                const auto& sc = j.at("scaling");
+                if (sc.contains("position")) d.position_scale = parse_scale(sc.at("position"));
+                if (sc.contains("force")) d.force_scale = parse_scale(sc.at("force"));
+                if (sc.contains("speed")) d.speed_scale = parse_scale(sc.at("speed"));
             }
         }
 
-        const auto& sc = j.at("scaling");
-        d.position_scale = parse_scale(sc.at("position"));
-        d.force_scale = parse_scale(sc.at("force"));
-        d.speed_scale = parse_scale(sc.at("speed"));
+        if (d.position_write.empty()) {
+            throw std::runtime_error("Descriptor has no position write registers");
+        }
+        if (d.position_read.empty()) {
+            d.position_read.push_back(d.position_write.front());
+        }
+        if (d.status_grasp.address == 0 && d.status_motion.address != 0) {
+            d.status_grasp = d.status_motion;
+        }
+        if (d.dof_count == 0) {
+            d.dof_count = std::max<size_t>(1, d.position_write.size());
+        }
+        if (!d.has_multi_joint && d.dof_count > 1) {
+            d.has_multi_joint = true;
+        }
 
-        return {{d.device_id, d}};
+        std::map<std::string, GripperDescriptor> by_id;
+        for (const auto& alias : descriptor_aliases(d.device_id)) {
+            by_id[alias] = d;
+        }
+        return by_id;
     }
 
 private:
@@ -347,45 +485,50 @@ private:
 
 class CommandMapper {
 public:
-    static std::vector<qnc::modbus::WriteMultipleCommand> map(
+    struct WriteAction {
+        uint16_t reg{0};
+        uint16_t value{0};
+        uint32_t timeout_ms{500};
+    };
+
+    static std::vector<WriteAction> map(
         const qnc::gripper::GripperCommand& cmd,
         const GripperDescriptor& d)
     {
         const auto [ovr_pos, ovr_force, ovr_speed] = parse_overrides(cmd.tag().c_str());
-        const float pos = static_cast<float>(clamp01(ovr_pos.value_or(cmd.position())));
-        const float force = static_cast<float>(clamp01(ovr_force.value_or(cmd.max_force())));
-        const float speed = static_cast<float>(clamp01(ovr_speed.value_or(cmd.max_speed())));
+        const size_t dof = std::max<size_t>(1, d.dof_count);
+        const auto pos = expand(ovr_pos, cmd.position(), dof);
+        const auto force = expand(ovr_force, cmd.max_force(), dof);
+        const auto speed = expand(ovr_speed, cmd.max_speed(), dof);
 
-        std::vector<qnc::modbus::WriteMultipleCommand> out;
-        out.push_back(make_wmc(d, d.position_write, to_raw(pos, d.position_scale), cmd));
+        std::vector<WriteAction> out;
+        for (size_t i = 0; i < std::min(d.position_write.size(), dof); ++i) {
+            out.push_back(make_write_action(d.position_write[i], to_raw(pos[i], d.position_scale), cmd));
+        }
 
         if (d.supports_force_control) {
-            for (const auto& reg : d.force_write) {
-                out.push_back(make_wmc(d, reg, to_raw(force, d.force_scale), cmd));
+            for (size_t i = 0; i < std::min(d.force_write.size(), dof); ++i) {
+                out.push_back(make_write_action(d.force_write[i], to_raw(force[i], d.force_scale), cmd));
             }
         }
         if (d.supports_speed_control) {
-            for (const auto& reg : d.speed_write) {
-                out.push_back(make_wmc(d, reg, to_raw(speed, d.speed_scale), cmd));
+            for (size_t i = 0; i < std::min(d.speed_write.size(), dof); ++i) {
+                out.push_back(make_write_action(d.speed_write[i], to_raw(speed[i], d.speed_scale), cmd));
             }
         }
         return out;
     }
 
 private:
-    static qnc::modbus::WriteMultipleCommand make_wmc(
-        const GripperDescriptor& d,
+    static WriteAction make_write_action(
         const RegisterRef& reg,
         uint16_t value,
         const qnc::gripper::GripperCommand& cmd)
     {
-        qnc::modbus::WriteMultipleCommand w;
-        w.slave_id(d.slave_id);
-        w.start_register(reg.address);
-        w.values({value});
-        w.timeout_ms(cmd.timeout() > 0.0f ? static_cast<uint32_t>(cmd.timeout() * 1000.0f) : 500);
-        w.tag(cmd.tag().c_str());
-        w.timestamp(iso_now().c_str());
+        WriteAction w;
+        w.reg = reg.address;
+        w.value = value;
+        w.timeout_ms = cmd.timeout() > 0.0f ? static_cast<uint32_t>(cmd.timeout() * 1000.0f) : 500;
         return w;
     }
 
@@ -400,9 +543,25 @@ private:
         return std::max(0.0, std::min(1.0, v));
     }
 
+    static std::vector<float> expand(
+        const std::optional<std::vector<float>>& maybe_vec,
+        float fallback_scalar,
+        size_t n)
+    {
+        if (maybe_vec.has_value()) {
+            if (maybe_vec->size() == n) {
+                return *maybe_vec;
+            }
+            if (maybe_vec->size() == 1) {
+                return std::vector<float>(n, maybe_vec->front());
+            }
+        }
+        return std::vector<float>(n, fallback_scalar);
+    }
+
     // Assumption: GripperCommand has no dedicated JSON payload field, so
     // advanced overrides are optionally encoded in `tag` as a JSON object.
-    static std::tuple<std::optional<float>, std::optional<float>, std::optional<float>>
+    static std::tuple<std::optional<std::vector<float>>, std::optional<std::vector<float>>, std::optional<std::vector<float>>>
     parse_overrides(const std::string& tag)
     {
         if (tag.empty() || tag.front() != '{') {
@@ -410,14 +569,30 @@ private:
         }
         try {
             json j = json::parse(tag);
-            std::optional<float> p, f, s;
-            if (j.contains("position")) p = j.at("position").get<float>();
-            if (j.contains("force")) f = j.at("force").get<float>();
-            if (j.contains("speed")) s = j.at("speed").get<float>();
+            std::optional<std::vector<float>> p, f, s;
+            if (j.contains("position")) p = parse_float_or_array(j.at("position"));
+            if (j.contains("force")) f = parse_float_or_array(j.at("force"));
+            if (j.contains("speed")) s = parse_float_or_array(j.at("speed"));
             return {p, f, s};
         } catch (...) {
             return {std::nullopt, std::nullopt, std::nullopt};
         }
+    }
+
+    static std::vector<float> parse_float_or_array(const json& value)
+    {
+        if (value.is_number()) {
+            return {value.get<float>()};
+        }
+        if (!value.is_array()) {
+            return {};
+        }
+        std::vector<float> out;
+        out.reserve(value.size());
+        for (const auto& it : value) {
+            out.push_back(it.get<float>());
+        }
+        return out;
     }
 };
 
@@ -502,11 +677,13 @@ public:
               int init_wait_ms1 = 5500,   // AG-160: 160 mm stroke ~4.5 s calibration
               int init_wait_ms2 = 3500,   // CGC-80:  95 mm stroke ~2.5 s calibration
               int init_wait_ms3 = 3500,   // DH-5-6
-              const std::string& gripper_descriptor = "")
+              const std::string& gripper_descriptor = "",
+              bool dry_run = false)
         : modbus1_(modbus1), slave_id1_(slave_id1), modbus_addr1_(modbus_addr1),
           modbus2_(modbus2), slave_id2_(slave_id2), modbus_addr2_(modbus_addr2),
           modbus3_(modbus3), slave_id3_(slave_id3), modbus_addr3_(modbus_addr3),
-          stats_interval_(stats_interval)
+            stats_interval_(stats_interval),
+            dry_run_(dry_run)
     {
         if (modbus1_) port_init_wait_ms_[modbus1_] = init_wait_ms1;
         if (modbus2_) port_init_wait_ms_[modbus2_] = init_wait_ms2;
@@ -524,45 +701,22 @@ public:
         auto pub_factory = neura::sync::PublisherFactory::getInstance(participant_);
         auto sub_factory = neura::sync::SubscriberFactory::getInstance(participant_);
 
-        node_->add_subscriber(
-            sub_factory->createDefaultSubscriber<
-                qnc::modbus::ReadCommand, qnc::modbus::ReadCommandPubSubType>(
-                "rc_sub", "qnc/modbus/read_cmd",
-                [this](const qnc::modbus::ReadCommand& msg) {
-                    std::lock_guard<std::mutex> lk(cmd_mutex_);
-                    read_queue_.push_back(msg);
-                }));
-
-        // Store wc_sub so wait_for_publisher_match() can access its DataReader.
-        wc_sub_ = sub_factory->createDefaultSubscriber<
-                qnc::modbus::WriteCommand, qnc::modbus::WriteCommandPubSubType>(
-                "wc_sub", "qnc/modbus/write_cmd",
-                [this](const qnc::modbus::WriteCommand& msg) {
-                    std::lock_guard<std::mutex> lk(cmd_mutex_);
-                    write_queue_.push_back(msg);
-                });
-        node_->add_subscriber(wc_sub_);
-
         // Generic gripper command ingress on the fixed high-level topic.
-        node_->add_subscriber(
-            sub_factory->createDefaultSubscriber<
+        // Use CriticalData (RELIABLE) to match all upstream command publishers
+        // (gripper_control_dds, gripper_runtime_validator, cgc80_validation all
+        // publish with createCriticalDataPublisher/RELIABLE).  A BEST_EFFORT
+        // subscription would still match, but commands could be silently lost.
+        gc_sub_ = sub_factory->createCriticalDataSubscriber<
                 qnc::gripper::GripperCommand, qnc::gripper::GripperCommandPubSubType>(
                 "gc_sub", "qnc/gripper/command",
                 [this](const qnc::gripper::GripperCommand& msg) {
                     std::lock_guard<std::mutex> lk(cmd_mutex_);
                     gripper_cmd_queue_.push_back(msg);
-                }));
+                });
+        node_->add_subscriber(gc_sub_);
 
-        // Response and stats publishers: CriticalData profile (RELIABLE, SYNC).
+        // State publisher: CriticalData profile (RELIABLE, SYNC).
         constexpr int64_t max_blocking_ns = 500000000; // 500 ms
-        node_->add_publisher(
-            pub_factory->createCriticalDataPublisher<
-                qnc::modbus::Response, qnc::modbus::ResponsePubSubType>(
-                "rsp_pub", "qnc/modbus/response", max_blocking_ns));
-        node_->add_publisher(
-            pub_factory->createCriticalDataPublisher<
-                qnc::modbus::BridgeStats, qnc::modbus::BridgeStatsPubSubType>(
-                "bs_pub", "qnc/modbus/stats", max_blocking_ns));
         node_->add_publisher(
             pub_factory->createCriticalDataPublisher<
                 qnc::gripper::GripperState, qnc::gripper::GripperStatePubSubType>(
@@ -580,8 +734,8 @@ public:
         start_time_ = std::chrono::steady_clock::now();
 
         std::cout << "[NeuraSync] QncBridge active on domain " << domain_id << "\n"
-                  << "      SUB: qnc/modbus/write_cmd  qnc/modbus/read_cmd  qnc/gripper/command\n"
-                  << "      PUB: qnc/modbus/response   qnc/modbus/stats     qnc/gripper/state\n";
+                  << "      SUB: qnc/gripper/command\n"
+                  << "      PUB: qnc/gripper/state\n";
         if (modbus1_)
             std::cout << "      RS485 port1 dds_slave_id=" << (int)slave_id1_
                       << "  modbus_wire_addr=" << (int)modbus_addr1_ << "\n";
@@ -605,7 +759,7 @@ public:
     QncBridge& operator=(const QncBridge&) = delete;
 
     /**
-     * Block until the robot platform's write_cmd publisher is matched (i.e.
+    * Block until the robot platform's gripper command publisher is matched.
      * DDS peer discovery is complete) or until timeout_ms elapses.
      * Returns true if matched, false on timeout.
      */
@@ -615,9 +769,9 @@ public:
         int       elapsed  = 0;
         std::cout << "[Bridge] Waiting for robot publisher match..." << std::flush;
 
-        // Access the write_cmd subscriber's DataReader to check for matched
+        // Access the gripper command subscriber's DataReader to check for matched
         // publications (peer discovery).
-        auto sub_base = wc_sub_;
+        auto sub_base = gc_sub_;
         if (!sub_base || !sub_base->get_data_reader()) {
             std::cout << " subscriber not found\n" << std::flush;
             return false;
@@ -638,9 +792,7 @@ public:
     }
 
     /**
-     * Block until g_running is false, processing all incoming DDS commands.
-     * Per-slave init windows are tracked in init_wait_map_ inside
-     * drain_write_commands() — each gripper calibrates independently.
+    * Block until g_running is false, processing all incoming gripper commands.
      */
     void spin()
     {
@@ -648,8 +800,6 @@ public:
 
         while (g_running.load()) {
             bool processed = false;
-            processed |= drain_write_commands();
-            processed |= drain_read_commands();
             processed |= drain_gripper_commands();
 
             if (!processed)
@@ -667,14 +817,11 @@ private:
     edds::DomainParticipant* participant_ = nullptr;
     std::shared_ptr<neura::sync::NeuraSyncNode> node_;
     std::shared_ptr<neura::sync::Subscriber<
-        qnc::modbus::WriteCommand, qnc::modbus::WriteCommandPubSubType>> wc_sub_;
+        qnc::gripper::GripperCommand, qnc::gripper::GripperCommandPubSubType>> gc_sub_;
 
-    // Callback→queue bridge: NeuraSync subscribers deliver messages via
-    // callbacks on the DDS listener thread. The queues buffer them for
-    // single-threaded serial processing in the main spin() loop.
+    // Callback->queue bridge: callbacks happen on DDS listener threads;
+    // serial IO remains single-threaded in spin().
     std::mutex cmd_mutex_;
-    std::vector<qnc::modbus::WriteCommand> write_queue_;
-    std::vector<qnc::modbus::ReadCommand> read_queue_;
     std::vector<qnc::gripper::GripperCommand> gripper_cmd_queue_;
 
     std::map<std::string, GripperDescriptor> gripper_descriptors_;
@@ -695,277 +842,17 @@ private:
     uint64_t    err_count_       = 0;
     long        last_err_        = 0;
     std::chrono::steady_clock::time_point start_time_;
+    bool        dry_run_         = false;
 
-    // Per-port init calibration windows (keyed by ModbusRtu* port pointer).
-    // When a port receives reg=0x0100 (init), its deadline is inserted here.
-    // Subsequent write_cmds for that port are discarded until the deadline
-    // passes, preventing stale motion commands from firing before the gripper
-    // finishes its calibration stroke.
-    std::map<ModbusRtu*, std::chrono::steady_clock::time_point> init_wait_map_;
-    std::mutex init_wait_mutex_;  // guards init_wait_map_ and pending_writes_map_
     // Per-port regular-init (val=1) guard duration in ms.
-    // AG-160 (160 mm stroke) needs ~5500 ms; CGC-80 (95 mm) needs ~3500 ms.
     std::map<ModbusRtu*, int> port_init_wait_ms_;
-    // Writes buffered while the per-port init guard is active.
-    // Replayed once the guard expires (by timeout or FC04 confirmation).
-    // Protected by init_wait_mutex_.
-    std::map<ModbusRtu*, std::vector<std::pair<uint16_t, uint16_t>>> pending_writes_map_;
 
-    // --- Route DDS slave_id to the matching (bus, wire_addr) pair ----------
-    // slave_id=1 → port1, slave_id=2 → port2, slave_id=3 → port3.
-    // Returns nullptr for the bus if no port is configured for that slave_id.
     std::pair<ModbusRtu*, uint8_t> route(uint8_t dds_slave_id) const
     {
         if (modbus1_ && dds_slave_id == slave_id1_) return {modbus1_, modbus_addr1_};
         if (modbus2_ && dds_slave_id == slave_id2_) return {modbus2_, modbus_addr2_};
         if (modbus3_ && dds_slave_id == slave_id3_) return {modbus3_, modbus_addr3_};
         return {nullptr, 0};
-    }
-
-    // Inverse of route(): look up the configured wire address for a given bus.
-    uint8_t wire_addr_for(ModbusRtu* bus) const
-    {
-        if (bus == modbus1_) return modbus_addr1_;
-        if (bus == modbus2_) return modbus_addr2_;
-        if (bus == modbus3_) return modbus_addr3_;
-        return 1;
-    }
-
-    // --- Process write_cmd (FC06) -------------------------------------------
-    // Route to the single port whose dds_slave_id matches sample.slave_id().
-    // Each port has its own init calibration window tracked in init_wait_map_.
-
-    bool drain_write_commands()
-    {
-        // Swap the callback queue under the lock, then process outside the
-        // lock so that new messages can keep arriving while we do serial I/O.
-        std::vector<qnc::modbus::WriteCommand> batch;
-        {
-            std::lock_guard<std::mutex> lk(cmd_mutex_);
-            batch.swap(write_queue_);
-        }
-        bool any = false;
-
-        for (auto& sample : batch) {
-            any = true;
-
-            const uint8_t  dds_slave = static_cast<uint8_t>(sample.slave_id());
-            const uint16_t reg = sample.register_address();
-            const uint16_t val = sample.value();
-
-            std::cout << "[CMD] write_cmd slave=" << (int)dds_slave
-                      << " reg=0x" << std::hex << std::setfill('0') << std::setw(4) << reg << std::dec
-                      << " val=" << val << "  tag=" << sample.tag().c_str() << "\n";
-
-            ++tx_count_;
-
-            auto [bus, wire_addr] = route(dds_slave);
-            if (!bus) {
-                std::cout << "  ⚠ No port configured for slave_id=" << (int)dds_slave << "\n";
-            } else {
-                // Per-port init calibration window check
-                {
-                    std::unique_lock<std::mutex> lk(init_wait_mutex_);
-                    auto it = init_wait_map_.find(bus);
-                    if (it != init_wait_map_.end()) {
-                        if (std::chrono::steady_clock::now() < it->second) {
-                            // Init commands (reg=0x0100) always bypass the guard: they reset
-                            // calibration, so the guard must be re-armed from scratch.
-                            // Discard any stale pending motion that was queued for the old
-                            // calibration window — it belongs to the previous robot session.
-                            if (reg == 0x0100 && (val == 1 || val == 165)) {
-                                pending_writes_map_.erase(bus);
-                                init_wait_map_.erase(it);
-                                lk.unlock();
-                                std::cout << "  [init] " << bus->port()
-                                          << " re-init during guard — resetting calibration\n"
-                                          << std::flush;
-                                // fall through to write_register + guard re-arm below
-                            } else {
-                            pending_writes_map_[bus].emplace_back(reg, val);
-                            lk.unlock();
-                            std::cout << "  ⏳ " << bus->port()
-                                      << " still calibrating — buffering reg=0x"
-                                      << std::hex << std::setw(4) << std::setfill('0') << reg
-                                      << " val=" << std::dec << val << "\n";
-                            goto next_write_sample;  // NOLINT — write is buffered
-                            }
-                        } else {
-                            init_wait_map_.erase(it);
-                            auto pit = pending_writes_map_.find(bus);
-                            std::vector<std::pair<uint16_t, uint16_t>> pending;
-                            if (pit != pending_writes_map_.end()) {
-                                pending = std::move(pit->second);
-                                pending_writes_map_.erase(pit);
-                            }
-                            lk.unlock();
-                            if (!pending.empty()) {
-                                std::cout << "  [init] " << bus->port()
-                                          << " guard cleared — replaying " << pending.size()
-                                          << " buffered write(s)\n" << std::flush;
-                                const uint8_t waddr = wire_addr_for(bus);
-                                for (auto& [preg, pval] : pending)
-                                    bus->write_register(waddr, preg, pval, 0);
-                            } else {
-                                std::cout << "  [init] " << bus->port()
-                                          << " calibration complete, ready for motion\n" << std::flush;
-                            }
-                        }
-                    } else {
-                        lk.unlock();
-                    }
-                }
-                std::cout << "  → " << bus->port() << "  modbus_addr=" << (int)wire_addr << "\n";
-                bus->write_register(wire_addr, reg, val, 0);
-                {
-                    // On init command: arm a guard then launch a background thread
-                    // that polls FC04 init_state until confirmed ready (init_state==2).
-                    // The background thread shrinks the guard to 500 ms once
-                    // confirmed, so motion writes queued behind init don't need to
-                    // wait for the full max_ms.  Using a detached thread keeps
-                    // drain_write_commands() non-blocking so the DDS queue stays
-                    // drained while the gripper calibrates.
-                    if (reg == 0x0100 && (val == 1 || val == 165)) {
-                        auto it_ms = port_init_wait_ms_.find(bus);
-                        const int max_ms = (it_ms != port_init_wait_ms_.end())
-                                           ? it_ms->second
-                                           : (val == 165 ? 12000 : 10000);
-
-                        {
-                            std::lock_guard<std::mutex> lk(init_wait_mutex_);
-                            init_wait_map_[bus] = std::chrono::steady_clock::now()
-                                                 + std::chrono::milliseconds(max_ms);
-                        }
-                        std::cout << "  [init] " << bus->port()
-                                  << " calibration started — background-polling FC04"
-                                  << " init_state (max " << max_ms << " ms)...\n"
-                                  << std::flush;
-
-                        const uint8_t poll_addr = wire_addr;
-                        auto* map_ptr   = &init_wait_map_;
-                        auto* mutex_ptr = &init_wait_mutex_;
-                        std::thread([bus, poll_addr, max_ms, map_ptr, mutex_ptr]() {
-                            const auto poll_end = std::chrono::steady_clock::now()
-                                                 + std::chrono::milliseconds(max_ms - 500);
-                            while (std::chrono::steady_clock::now() < poll_end) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(400));
-                                std::vector<uint16_t> st;
-                                if (bus->read_input_registers(poll_addr, 0x0200, 1, st, 700)
-                                        && !st.empty() && st[0] == 2) {
-                                    std::cout << "  [init] \u2713 " << bus->port()
-                                              << " init_state=2 confirmed"
-                                              << " \u2014 releasing guard (500 ms flush)\n"
-                                              << std::flush;
-                                    std::lock_guard<std::mutex> lg(*mutex_ptr);
-                                    (*map_ptr)[bus] = std::chrono::steady_clock::now()
-                                                     + std::chrono::milliseconds(500);
-                                    return;
-                                }
-                            }
-                            std::cout << "  [init] \u26a0 " << bus->port()
-                                      << " init_state=2 not confirmed within "
-                                      << max_ms << " ms \u2014 guard expires naturally\n"
-                                      << std::flush;
-                        }).detach();
-                    }
-                }
-            }
-            next_write_sample:
-
-            if (tx_count_ % static_cast<uint64_t>(stats_interval_) == 0)
-                publish_stats("periodic");
-        }
-
-        // Flush pending writes for any guards that have quietly expired while
-        // the DDS loop ran (handles: all motion writes arrived during the guard
-        // and no further DDS write arrives to trigger the per-sample path).
-        {
-            std::map<ModbusRtu*, std::vector<std::pair<uint16_t, uint16_t>>> to_flush;
-            {
-                std::lock_guard<std::mutex> lk(init_wait_mutex_);
-                for (auto it = init_wait_map_.begin(); it != init_wait_map_.end(); ) {
-                    if (std::chrono::steady_clock::now() >= it->second) {
-                        ModbusRtu* bus = it->first;
-                        it = init_wait_map_.erase(it);
-                        auto pit = pending_writes_map_.find(bus);
-                        if (pit != pending_writes_map_.end()) {
-                            to_flush[bus] = std::move(pit->second);
-                            pending_writes_map_.erase(pit);
-                        }
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-            for (auto& [bus, writes] : to_flush) {
-                if (!writes.empty()) {
-                    std::cout << "  [init] " << bus->port()
-                              << " guard expired — replaying " << writes.size()
-                              << " buffered write(s)\n" << std::flush;
-                    const uint8_t waddr = wire_addr_for(bus);
-                    for (auto& [preg, pval] : writes)
-                        bus->write_register(waddr, preg, pval, 0);
-                    any = true;
-                }
-            }
-        }
-        return any;
-    }
-
-    // --- Process read_cmd (FC03 / FC04) -------------------------------------
-    // Route to the single port whose dds_slave_id matches sample.slave_id().
-
-    bool drain_read_commands()
-    {
-        std::vector<qnc::modbus::ReadCommand> batch;
-        {
-            std::lock_guard<std::mutex> lk(cmd_mutex_);
-            batch.swap(read_queue_);
-        }
-        bool any = false;
-
-        for (auto& sample : batch) {
-            any = true;
-
-            const uint8_t  slave = static_cast<uint8_t>(sample.slave_id());
-            const uint16_t start = sample.start_register();
-            const uint16_t cnt   = std::min(static_cast<uint16_t>(
-                                       sample.count()), static_cast<uint16_t>(125));
-            const bool     use_fc04 =
-                (sample.function_code() != qnc::FunctionCode::FC_READ_HOLDING_REGISTERS);
-
-            std::cout << "[CMD] read_cmd  slave=" << (int)slave
-                      << " reg=0x" << std::hex << std::setfill('0') << std::setw(4) << start << std::dec
-                      << " cnt=" << cnt
-                      << "  " << (use_fc04 ? "FC04" : "FC03")
-                      << "  tag=" << sample.tag().c_str() << "\n";
-
-            auto [bus, wire_addr] = route(slave);
-            if (!bus) {
-                std::cout << "  ⚠ No port configured for slave_id=" << (int)slave << "\n";
-                publish_response_data(slave, start, {}, qnc::EC_DISCONNECTED,
-                                      std::string(sample.tag().c_str()));
-                continue;
-            }
-
-            std::cout << "  → " << bus->port()
-                      << "  modbus_addr=" << (int)wire_addr << "\n";
-            std::vector<uint16_t> regs;
-            long err_code = qnc::EC_SUCCESS;
-            bool ok = use_fc04
-                ? bus->read_input_registers(wire_addr, start, cnt, regs, 1000)
-                : bus->read_holding_registers(wire_addr, start, cnt, regs, 1000);
-            if (ok) {
-                ++rx_count_;
-            } else {
-                err_code = qnc::EC_TIMEOUT;
-                ++err_count_;
-                last_err_ = err_code;
-            }
-            publish_response_data(slave, start, regs, err_code,
-                                  std::string(sample.tag().c_str()));
-        }
-        return any;
     }
 
     bool drain_gripper_commands()
@@ -980,52 +867,280 @@ private:
         for (const auto& cmd : batch) {
             any = true;
             const std::string device_id(cmd.device_id().c_str());
-            auto dit = gripper_descriptors_.find(device_id);
+
+            // Raw transport mode: execute register writes/reads directly from
+            // GripperCommand transport fields, bypassing descriptor mapping.
+            if (cmd.command_type() == qnc::gripper::GripperCommandType::CMD_RAW_MODBUS
+                || !cmd.raw_writes().empty()
+                || cmd.raw_read_count() > 0)
+            {
+                uint8_t dds_slave = static_cast<uint8_t>(cmd.slave_id_hint());
+                if (dds_slave == 0) {
+                    auto it = gripper_descriptors_.find(device_id);
+                    if (it != gripper_descriptors_.end()) {
+                        dds_slave = it->second.slave_id;
+                    }
+                }
+
+                auto [bus, wire_addr] = route(dds_slave);
+                const char* port_label = (bus == modbus1_) ? "port1" :
+                                         (bus == modbus2_) ? "port2" :
+                                         (bus == modbus3_) ? "port3" : "NONE";
+                std::cout << "[TRACE] device_id=" << device_id
+                          << "  dds_slave=" << (int)dds_slave
+                          << "  → " << port_label
+                          << "  wire_addr=" << (int)wire_addr
+                          << "  writes=" << cmd.raw_writes().size()
+                          << "  read_count=" << cmd.raw_read_count()
+                          << "  read_fc=" << (int)cmd.raw_read_fc()
+                          << "  tag=" << cmd.tag() << "\n" << std::flush;
+                if (!bus) {
+                    if (dry_run_) {
+                        qnc::gripper::GripperState st;
+                        st.device_id(cmd.device_id());
+                        st.last_command_type_code(static_cast<int32_t>(cmd.command_type()));
+                        st.status(qnc::gripper::GripperStatus::STATUS_IDLE);
+                        st.grasp_result(qnc::gripper::GraspResult::GRASP_UNKNOWN);
+                        st.error_code(EC_SUCCESS);
+                        st.bridge_error_code(EC_SUCCESS);
+                        st.message("dry_run_no_bus");
+                        st.bridge_error_message("");
+                        st.last_command_tag(cmd.tag());
+                        st.timestamp(iso_now());
+                        publish_gripper_state(st);
+                        continue;
+                    }
+                    qnc::gripper::GripperState st;
+                    st.device_id(cmd.device_id());
+                    st.last_command_type_code(static_cast<int32_t>(cmd.command_type()));
+                    st.status(qnc::gripper::GripperStatus::STATUS_ERROR);
+                    st.grasp_result(qnc::gripper::GraspResult::GRASP_FAILED_ERROR);
+                    st.error_code(EC_DISCONNECTED);
+                    st.bridge_error_code(EC_DISCONNECTED);
+                    st.message("No route for slave_id");
+                    st.bridge_error_message("No port configured for requested slave_id");
+                    st.last_command_tag(cmd.tag());
+                    st.timestamp(iso_now());
+                    publish_gripper_state(st);
+                    continue;
+                }
+
+                int32_t err = EC_SUCCESS;
+                for (const auto& w : cmd.raw_writes()) {
+                    ++tx_count_;
+                    const bool ok = bus->write_register(wire_addr, w.register_address(), w.value(), 500);
+                    std::cout << "[TRACE]   WRITE " << port_label
+                              << " addr=" << (int)wire_addr
+                              << " reg=0x" << std::hex << w.register_address() << std::dec
+                              << " val=" << w.value()
+                              << " → " << (ok ? "OK" : "FAIL") << "\n" << std::flush;
+                    if (ok) {
+                        ++rx_count_;
+                    } else {
+                        err = EC_TIMEOUT;
+                        ++err_count_;
+                        last_err_ = err;
+                    }
+                }
+
+                std::vector<uint16_t> regs;
+                if (cmd.raw_read_count() > 0) {
+                    const uint16_t count = std::min<uint16_t>(cmd.raw_read_count(), 125);
+                    // Enforce FC03 for bridge-level reads to keep transport behavior
+                    // stable across devices that misreport FC04 support.
+                    const bool read_ok = bus->read_holding_registers(
+                        wire_addr, cmd.raw_read_start_register(), count, regs, 1000);
+                    std::cout << "[TRACE]   READ " << port_label
+                              << " addr=" << (int)wire_addr
+                              << " reg=0x" << std::hex << cmd.raw_read_start_register() << std::dec
+                              << " count=" << count
+                              << " fc=3"
+                              << " → " << (read_ok ? "OK" : "FAIL")
+                              << " regs=[";
+                    for (size_t ri = 0; ri < regs.size(); ++ri) {
+                        if (ri) std::cout << ",";
+                        std::cout << regs[ri];
+                    }
+                    std::cout << "]\n" << std::flush;
+                    if (read_ok) {
+                        ++rx_count_;
+                    } else {
+                        err = EC_TIMEOUT;
+                        ++err_count_;
+                        last_err_ = err;
+                    }
+                }
+
+                qnc::gripper::GripperState st;
+                st.device_id(cmd.device_id());
+                st.last_command_type_code(static_cast<int32_t>(cmd.command_type()));
+                st.position(cmd.position());
+                st.force(cmd.max_force());
+                st.speed(cmd.max_speed());
+                st.status(err == EC_SUCCESS
+                    ? qnc::gripper::GripperStatus::STATUS_IDLE
+                    : qnc::gripper::GripperStatus::STATUS_ERROR);
+                st.grasp_result(err == EC_SUCCESS
+                    ? qnc::gripper::GraspResult::GRASP_UNKNOWN
+                    : qnc::gripper::GraspResult::GRASP_FAILED_ERROR);
+                st.error_code(err);
+                st.bridge_error_code(err);
+                st.message(err == EC_SUCCESS ? "raw_modbus_ok" : "raw_modbus_error");
+                st.bridge_error_message(err == EC_SUCCESS ? "" : "raw transport read/write timeout");
+                st.last_command_tag(cmd.tag());
+                st.slave_id(dds_slave);
+                st.last_command_latency_us(0);
+                st.bridge_latency_us(0);
+                st.has_transport_snapshot(cmd.raw_read_count() > 0);
+                st.transport_snapshot().start_register(cmd.raw_read_start_register());
+                st.transport_snapshot().data(regs);
+                st.timestamp(iso_now());
+                publish_gripper_state(st);
+                continue;
+            }
+
+            const auto find_descriptor = [&](const std::string& id)
+                -> std::map<std::string, GripperDescriptor>::const_iterator {
+                for (const auto& key : descriptor_aliases(id)) {
+                    auto it = gripper_descriptors_.find(key);
+                    if (it != gripper_descriptors_.end()) {
+                        return it;
+                    }
+                }
+                return gripper_descriptors_.end();
+            };
+
+            auto dit = find_descriptor(device_id);
             if (dit == gripper_descriptors_.end()) {
                 std::cerr << "[Gripper] descriptor not found for device_id=" << device_id << "\n";
+                if (dry_run_) {
+                    qnc::gripper::GripperState st;
+                    st.device_id(cmd.device_id());
+                    st.last_command_type_code(static_cast<int32_t>(cmd.command_type()));
+                    st.status(qnc::gripper::GripperStatus::STATUS_IDLE);
+                    st.grasp_result(qnc::gripper::GraspResult::GRASP_UNKNOWN);
+                    st.error_code(EC_SUCCESS);
+                    st.bridge_error_code(EC_SUCCESS);
+                    st.message("dry_run_no_descriptor");
+                    st.bridge_error_message("");
+                    st.last_command_tag(cmd.tag());
+                    st.timestamp(iso_now());
+                    publish_gripper_state(st);
+                    continue;
+                }
+                // Publish an explicit error state so subscribers (e.g. gripper_runtime_validator)
+                // do not time out waiting for feedback that would never arrive.
+                qnc::gripper::GripperState err_st;
+                err_st.device_id(cmd.device_id());
+                err_st.last_command_type_code(static_cast<int32_t>(cmd.command_type()));
+                err_st.status(qnc::gripper::GripperStatus::STATUS_ERROR);
+                err_st.grasp_result(qnc::gripper::GraspResult::GRASP_FAILED_ERROR);
+                err_st.error_code(EC_DISCONNECTED);
+                err_st.bridge_error_code(EC_DISCONNECTED);
+                err_st.message("no descriptor for device_id");
+                err_st.bridge_error_message("load a gripper descriptor via --descriptor flag");
+                err_st.last_command_tag(cmd.tag());
+                err_st.timestamp(iso_now());
+                publish_gripper_state(err_st);
+                ++err_count_;
                 continue;
             }
             const auto& desc = dit->second;
             auto [bus, wire_addr] = route(desc.slave_id);
             if (!bus) {
+                if (dry_run_) {
+                    qnc::gripper::GripperState st;
+                    st.device_id(cmd.device_id());
+                    st.last_command_type_code(static_cast<int32_t>(cmd.command_type()));
+                    st.status(qnc::gripper::GripperStatus::STATUS_IDLE);
+                    st.grasp_result(qnc::gripper::GraspResult::GRASP_UNKNOWN);
+                    st.error_code(EC_SUCCESS);
+                    st.bridge_error_code(EC_SUCCESS);
+                    st.message("dry_run_no_route");
+                    st.bridge_error_message("");
+                    st.last_command_tag(cmd.tag());
+                    st.timestamp(iso_now());
+                    publish_gripper_state(st);
+                    continue;
+                }
                 std::cerr << "[Gripper] no route for slave_id=" << (int)desc.slave_id << "\n";
                 continue;
             }
 
             const auto writes = CommandMapper::map(cmd, desc);
+            std::cout << "[MAP] device_id=" << device_id
+                      << " dof_count=" << desc.dof_count
+                      << " writes=" << writes.size()
+                      << " has_multi_joint=" << (desc.has_multi_joint ? "true" : "false")
+                      << " tag=" << cmd.tag() << "\n";
             for (const auto& w : writes) {
-                const uint16_t reg = w.start_register();
-                const uint16_t val = w.values().empty() ? 0 : w.values()[0];
-                bus->write_register(wire_addr, reg, val, 0);
+                std::cout << "[MAP]   FC06 reg=0x" << std::hex << w.reg << std::dec
+                          << " value=" << w.value << "\n";
+                bus->write_register(wire_addr, w.reg, w.value, w.timeout_ms);
                 ++tx_count_;
             }
 
-            std::vector<uint16_t> pos_data;
-            std::vector<uint16_t> motion_data;
-            std::vector<uint16_t> grasp_data;
-            int32_t err = qnc::EC_SUCCESS;
+            std::vector<uint16_t> pos_values;
+            std::vector<uint16_t> dof_states;
+            int32_t err = EC_SUCCESS;
 
-            const bool pos_ok = desc.position_read.fc == 4
-                ? bus->read_input_registers(wire_addr, desc.position_read.address, 1, pos_data, 800)
-                : bus->read_holding_registers(wire_addr, desc.position_read.address, 1, pos_data, 800);
-            const bool motion_ok = desc.status_motion.fc == 4
-                ? bus->read_input_registers(wire_addr, desc.status_motion.address, 1, motion_data, 800)
-                : bus->read_holding_registers(wire_addr, desc.status_motion.address, 1, motion_data, 800);
-            const bool grasp_ok = desc.status_grasp.fc == 4
-                ? bus->read_input_registers(wire_addr, desc.status_grasp.address, 1, grasp_data, 800)
-                : bus->read_holding_registers(wire_addr, desc.status_grasp.address, 1, grasp_data, 800);
+            // Enforce FC03 on descriptor-driven reads.
+            for (const auto& pref : desc.position_read) {
+                std::vector<uint16_t> one;
+                if (bus->read_holding_registers(wire_addr, pref.address, 1, one, 800) && !one.empty()) {
+                    pos_values.push_back(one[0]);
+                } else {
+                    err = EC_TIMEOUT;
+                }
+            }
 
-            if (!(pos_ok && motion_ok && grasp_ok)) {
-                err = qnc::EC_TIMEOUT;
+            if (desc.has_multi_joint && desc.status_dof_count > 0) {
+                for (size_t i = 0; i < desc.status_dof_count; ++i) {
+                    std::vector<uint16_t> one;
+                    const uint16_t addr = static_cast<uint16_t>(desc.status_base + i * desc.status_stride);
+                    if (bus->read_holding_registers(wire_addr, addr, 1, one, 800) && !one.empty()) {
+                        dof_states.push_back(one[0]);
+                    } else {
+                        err = EC_TIMEOUT;
+                    }
+                }
+            } else {
+                std::vector<uint16_t> one;
+                if (bus->read_holding_registers(wire_addr, desc.status_motion.address, 1, one, 800) && !one.empty()) {
+                    dof_states.push_back(one[0]);
+                } else {
+                    err = EC_TIMEOUT;
+                }
+            }
+
+            if (err != EC_SUCCESS) {
                 ++err_count_;
                 last_err_ = err;
             } else {
                 ++rx_count_;
             }
 
-            const uint16_t raw_pos = pos_data.empty() ? 0 : pos_data[0];
-            const uint16_t raw_motion = motion_data.empty() ? 0 : motion_data[0];
-            const uint16_t raw_grasp = grasp_data.empty() ? 0 : grasp_data[0];
+            const uint16_t raw_pos = pos_values.empty()
+                ? 0
+                : static_cast<uint16_t>(std::accumulate(pos_values.begin(), pos_values.end(), 0u) / pos_values.size());
+
+            bool any_moving = false;
+            bool all_at_target = !dof_states.empty();
+            bool any_error = false;
+            for (uint16_t s : dof_states) {
+                // Typical DH56 semantics: 0=moving, 1=at target/idle, 2=contact, 3=error.
+                if (s == 0) any_moving = true;
+                if (!(s == 1 || s == 2)) all_at_target = false;
+                if (s >= 3) any_error = true;
+            }
+            const uint16_t raw_motion = any_moving ? 0 : 1;
+            const uint16_t raw_grasp = any_error ? 0 : (all_at_target ? 2 : 1);
+
+            std::cout << "[MAP]   status_dofs=" << dof_states.size()
+                      << " any_moving=" << (any_moving ? "true" : "false")
+                      << " any_error=" << (any_error ? "true" : "false")
+                      << " all_at_target=" << (all_at_target ? "true" : "false")
+                      << " avg_pos_raw=" << raw_pos << "\n";
 
             auto state = StateMapper::map(
                 desc,
@@ -1036,29 +1151,15 @@ private:
                 0,
                 std::string(cmd.tag().c_str()));
             publish_gripper_state(state);
+
+            if (tx_count_ % static_cast<uint64_t>(stats_interval_) == 0) {
+                publish_stats("periodic");
+            }
         }
         return any;
     }
 
     // --- Publish helpers ----------------------------------------------------
-
-    void publish_response_data(uint8_t slave, uint16_t start,
-                                const std::vector<uint16_t>& regs,
-                                long err_code, const std::string& tag)
-    {
-        if (!node_) return;
-        qnc::modbus::Response msg;
-        msg.slave_id(slave);
-        msg.start_register(start);
-        msg.function_code(qnc::FunctionCode::FC_READ_INPUT_REGISTERS);
-        for (auto v : regs) msg.data().push_back(v);
-        msg.error_code(err_code);
-        msg.tag(tag);
-        msg.timestamp(iso_now());
-        node_->set_publisher_buffer<qnc::modbus::Response,
-                                    qnc::modbus::ResponsePubSubType>("rsp_pub", msg);
-        node_->publish("rsp_pub");
-    }
 
     void publish_gripper_state(const qnc::gripper::GripperState& state)
     {
@@ -1070,22 +1171,8 @@ private:
 
     void publish_stats(const std::string& reason)
     {
-        if (!node_) return;
         double uptime = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - start_time_).count();
-        qnc::modbus::BridgeStats msg;
-        msg.device_id("qnc_bridge_rs485");
-        msg.device_connected(modbus1_ != nullptr || modbus2_ != nullptr || modbus3_ != nullptr);
-        msg.tx_count(tx_count_);
-        msg.rx_count(rx_count_);
-        msg.error_count(err_count_);
-        msg.last_error_code(last_err_);
-        msg.avg_latency_us(0);
-        msg.uptime_seconds(uptime);
-        msg.timestamp(iso_now());
-        node_->set_publisher_buffer<qnc::modbus::BridgeStats,
-                                    qnc::modbus::BridgeStatsPubSubType>("bs_pub", msg);
-        node_->publish("bs_pub");
         std::cout << "[Stats/" << reason << "] tx=" << tx_count_
                   << " rx=" << rx_count_ << " err=" << err_count_
                   << " uptime=" << static_cast<int>(uptime) << "s\n";
@@ -1146,10 +1233,12 @@ int main()
     const char* env_iwait2   = std::getenv("QNC_INIT_WAIT_MS_2");
     const char* env_iwait3   = std::getenv("QNC_INIT_WAIT_MS_3");
     const char* env_gdesc    = std::getenv("QNC_GRIPPER_DESCRIPTOR");
+    const char* env_dry_run  = std::getenv("QNC_DRY_RUN");
     const int init_wait_ms1  = env_iwait1 ? std::atoi(env_iwait1) : 30000;  // AG-160: 160 mm stroke takes 15-20 s; bg FC04 poll shortens if confirmed sooner
     const int init_wait_ms2  = env_iwait2 ? std::atoi(env_iwait2) : 8000;   // CGC-80: max poll timeout
     const int init_wait_ms3  = env_iwait3 ? std::atoi(env_iwait3) : 8000;   // DH-5-6: max poll timeout
     const std::string gripper_desc_path = env_gdesc ? env_gdesc : "";
+    const bool dry_run_mode = env_dry_run && std::string(env_dry_run) != "0";
 
     int gpio_num = -1;
     if (gpio_str != "none") {
@@ -1178,6 +1267,7 @@ int main()
     std::cout << "  DE/RE GPIO   : " << gpio_str << "\n"
               << "  DDS domain   : " << domain_id << "\n"
               << "  Stats interval: every " << stats_interval << " writes\n"
+              << "  Dry-run mode : " << (dry_run_mode ? "enabled" : "disabled") << "\n"
               << "  Gripper descriptor: " << (gripper_desc_path.empty() ? "<disabled>" : gripper_desc_path) << "\n\n";
 
     // --- Open RS485 port(s) -------------------------------------------------
@@ -1247,7 +1337,8 @@ int main()
                          modbus3.get(), slave_id3, modbus_addr3,
                          domain_id, stats_interval,
                          init_wait_ms1, init_wait_ms2, init_wait_ms3,
-                         gripper_desc_path);
+                         gripper_desc_path,
+                         dry_run_mode);
 
         // Wait for the robot platform's DDS publisher to be discovered before
         // declaring "Waiting for commands". This eliminates the race where
